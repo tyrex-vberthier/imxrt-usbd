@@ -18,6 +18,7 @@ exclude = [
 [dependencies]
 bitflags = "2"
 cortex-m = "0.7"
+heapless = "0.8"
 imxrt-ral = "0.6"
 usb-device = "0.3"
 

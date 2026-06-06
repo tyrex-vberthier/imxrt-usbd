@@ -62,7 +62,7 @@ mod vcell;
 pub use buffer::EndpointMemory;
 pub use bus::{BusAdapter, Speed};
 pub mod gpt;
-pub use state::{EndpointState, MAX_ENDPOINTS};
+pub use state::{EndpointState, MAX_ENDPOINTS, RING_DEPTH};
 
 /// Aggregate of `imxrt-ral` USB peripheral instances.
 ///

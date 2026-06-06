@@ -305,6 +305,16 @@ impl BusAdapter {
     pub fn bulk_poll_complete(&self, ep: EndpointAddress) -> Option<usize> {
         self.with_usb_mut(|usb| usb.bulk_ep_poll(ep))
     }
+
+    /// Returns `true` when the IN endpoint's multi-TD ring has no in-flight dTDs
+    /// (every primed transfer has been delivered to the host and drained).
+    ///
+    /// The BOT transport uses this to serialize the CSW at a command boundary —
+    /// the multi-TD ring otherwise lets the next command's response pipeline in
+    /// before the prior CSW is read, which the host sees as a stale/duplicate CSW.
+    pub fn in_ep_drained(&self, ep: EndpointAddress) -> bool {
+        self.with_usb_mut(|usb| usb.ep_ring_drained(ep))
+    }
 }
 
 impl UsbBus for BusAdapter {
@@ -325,14 +335,24 @@ impl UsbBus for BusAdapter {
         _interval: u8,
     ) -> usb_device::Result<EndpointAddress> {
         self.with_usb_mut(|usb| {
+            let depth = if ep_type == EndpointType::Bulk {
+                crate::state::RING_DEPTH
+            } else {
+                1
+            };
+
             if let Some(addr) = ep_addr {
                 if usb.is_allocated(addr) {
                     return Err(usb_device::UsbError::InvalidEndpoint);
                 }
-                let buffer = usb
-                    .allocate_buffer(max_packet_size as usize)
-                    .ok_or(usb_device::UsbError::EndpointMemoryOverflow)?;
-                usb.allocate_ep(addr, buffer, ep_type);
+                let mut buffers = heapless::Vec::<_, { crate::state::RING_DEPTH }>::new();
+                for _ in 0..depth {
+                    let buf = usb
+                        .allocate_buffer(max_packet_size as usize)
+                        .ok_or(usb_device::UsbError::EndpointMemoryOverflow)?;
+                    let _ = buffers.push(buf);
+                }
+                usb.allocate_ep(addr, buffers, ep_type);
                 Ok(addr)
             } else {
                 for idx in 1..8 {
@@ -340,10 +360,14 @@ impl UsbBus for BusAdapter {
                     if usb.is_allocated(addr) {
                         continue;
                     }
-                    let buffer = usb
-                        .allocate_buffer(max_packet_size as usize)
-                        .ok_or(usb_device::UsbError::EndpointMemoryOverflow)?;
-                    usb.allocate_ep(addr, buffer, ep_type);
+                    let mut buffers = heapless::Vec::<_, { crate::state::RING_DEPTH }>::new();
+                    for _ in 0..depth {
+                        let buf = usb
+                            .allocate_buffer(max_packet_size as usize)
+                            .ok_or(usb_device::UsbError::EndpointMemoryOverflow)?;
+                        let _ = buffers.push(buf);
+                    }
+                    usb.allocate_ep(addr, buffers, ep_type);
                     return Ok(addr);
                 }
                 Err(usb_device::UsbError::EndpointOverflow)

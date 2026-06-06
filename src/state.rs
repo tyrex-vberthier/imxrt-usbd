@@ -12,16 +12,21 @@ use usb_device::{
     endpoint::{EndpointAddress, EndpointType},
 };
 
-/// A list of transfer descriptors
+/// Number of TDs allocated per endpoint slot (ring depth).
+pub const RING_DEPTH: usize = 8;
+
+/// A list of transfer descriptor rings.
 ///
-/// Supports 1 TD per QH (per endpoint direction)
+/// Each endpoint slot holds `RING_DEPTH` TDs laid out contiguously so that
+/// every TD is individually 32-byte-aligned (Td is 32 B on ARM).
 #[repr(align(32))]
-struct TdList<const COUNT: usize>([UnsafeCell<Td>; COUNT]);
+struct TdList<const COUNT: usize>([UnsafeCell<[Td; RING_DEPTH]>; COUNT]);
 
 impl<const COUNT: usize> TdList<COUNT> {
     const fn new() -> Self {
-        const TD: UnsafeCell<Td> = UnsafeCell::new(Td::new());
-        Self([TD; COUNT])
+        const TD_RING: UnsafeCell<[Td; RING_DEPTH]> =
+            UnsafeCell::new([const { Td::new() }; RING_DEPTH]);
+        Self([TD_RING; COUNT])
     }
 }
 
@@ -150,7 +155,7 @@ impl<const COUNT: usize> EndpointState<COUNT> {
 
 pub struct EndpointAllocator<'a> {
     qh_list: &'a [UnsafeCell<Qh>],
-    td_list: &'a [UnsafeCell<Td>],
+    td_list: &'a [UnsafeCell<[Td; RING_DEPTH]>],
     ep_list: &'a [UnsafeCell<MaybeUninit<Endpoint>>],
     alloc_mask: &'a AtomicU32,
 }
@@ -252,7 +257,7 @@ impl EndpointAllocator<'_> {
     pub fn allocate_endpoint(
         &mut self,
         addr: EndpointAddress,
-        buffer: Buffer,
+        buffers: heapless::Vec<Buffer, RING_DEPTH>,
         kind: EndpointType,
     ) -> Option<&mut Endpoint> {
         let index = index(addr);
@@ -267,7 +272,7 @@ impl EndpointAllocator<'_> {
         // allocation, and ensures that we only release one &mut reference for each
         // component.
         let qh = unsafe { &mut *self.qh_list[index].get() };
-        let td = unsafe { &mut *self.td_list[index].get() };
+        let tds: &'static mut [Td] = unsafe { &mut *self.td_list[index].get() };
         // We cannot access these two components after this call. The endpoint
         // takes mutable references, so it has exclusive ownership of both.
         // This module is designed to isolate this access so we can visually
@@ -276,7 +281,7 @@ impl EndpointAllocator<'_> {
         // EP is uninitialized.
         let ep = unsafe { &mut *self.ep_list[index].get() };
         // Nothing to drop here.
-        ep.write(Endpoint::new(addr, qh, td, buffer, kind));
+        ep.write(Endpoint::new(addr, qh, tds, buffers, kind));
         // Safety: EP is initialized.
         Some(unsafe { ep.assume_init_mut() })
     }
@@ -284,7 +289,7 @@ impl EndpointAllocator<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EndpointAddress, EndpointState, EndpointType};
+    use super::{EndpointAddress, EndpointState, EndpointType, RING_DEPTH};
     use crate::buffer;
 
     #[test]
@@ -298,10 +303,19 @@ mod tests {
 
     #[test]
     fn allocate_endpoint() {
-        let mut buffer = [0; 128];
+        // Need enough memory for RING_DEPTH buffers per bulk EP plus control buffers.
+        // Conservative: 2 bytes × RING_DEPTH × 3 EPs + some overhead = 256 is enough.
+        let mut buffer = [0; 256];
         let mut buffer_alloc = unsafe { buffer::Allocator::from_buffer(&mut buffer) };
         let ep_state = EndpointState::max_endpoints();
         let mut ep_alloc = ep_state.allocator().unwrap();
+
+        // Helper: build a 1-buffer vec for control/interrupt EPs.
+        let make_ctrl_bufs = |alloc: &mut buffer::Allocator, size: usize| {
+            let mut v = heapless::Vec::<_, RING_DEPTH>::new();
+            let _ = v.push(alloc.allocate(size).unwrap());
+            v
+        };
 
         // First endpoint allocation.
         let addr = EndpointAddress::from(0);
@@ -311,7 +325,7 @@ mod tests {
         let ep = ep_alloc
             .allocate_endpoint(
                 addr,
-                buffer_alloc.allocate(2).unwrap(),
+                make_ctrl_bufs(&mut buffer_alloc, 2),
                 EndpointType::Control,
             )
             .unwrap();
@@ -323,7 +337,7 @@ mod tests {
         // Double-allocate existing endpoint.
         let ep = ep_alloc.allocate_endpoint(
             addr,
-            buffer_alloc.allocate(2).unwrap(),
+            make_ctrl_bufs(&mut buffer_alloc, 2),
             EndpointType::Control,
         );
         assert!(ep.is_none());
@@ -340,7 +354,7 @@ mod tests {
         let ep = ep_alloc
             .allocate_endpoint(
                 addr,
-                buffer_alloc.allocate(2).unwrap(),
+                make_ctrl_bufs(&mut buffer_alloc, 2),
                 EndpointType::Control,
             )
             .unwrap();
@@ -353,7 +367,11 @@ mod tests {
         assert!(ep_alloc.endpoint_mut(addr).is_none());
 
         let ep = ep_alloc
-            .allocate_endpoint(addr, buffer_alloc.allocate(4).unwrap(), EndpointType::Bulk)
+            .allocate_endpoint(
+                addr,
+                make_ctrl_bufs(&mut buffer_alloc, 4),
+                EndpointType::Bulk,
+            )
             .unwrap();
         assert_eq!(ep.address(), addr);
 
@@ -372,11 +390,43 @@ mod tests {
         let addr = EndpointAddress::from(42);
         let ep = ep_alloc.allocate_endpoint(
             addr,
-            buffer_alloc.allocate(4).unwrap(),
+            make_ctrl_bufs(&mut buffer_alloc, 4),
             EndpointType::Interrupt,
         );
         assert!(ep.is_none());
 
         assert_eq!(ep_alloc.endpoints_iter_mut().count(), 3);
+    }
+
+    /// Verify that a bulk EP gets RING_DEPTH TDs and RING_DEPTH buffers,
+    /// while a control EP gets 1 TD (from a 1-element buffers vec).
+    #[test]
+    fn ring_allocates_n_tds_per_ep() {
+        // Need enough memory for RING_DEPTH × 64 bytes for bulk + 8 bytes for ctrl.
+        // RING_DEPTH=8, so 8×64 + 8 = 520 bytes; use 1024 for headroom.
+        let mut raw = [0u8; 1024];
+        let mut alloc = unsafe { buffer::Allocator::from_buffer(&mut raw) };
+        let ep_state = EndpointState::max_endpoints();
+        let mut ep_alloc = ep_state.allocator().unwrap();
+
+        // Bulk OUT: allocate RING_DEPTH buffers.
+        let bulk_addr = EndpointAddress::from(2); // EP1 OUT
+        let mut bulk_bufs = heapless::Vec::<_, RING_DEPTH>::new();
+        for _ in 0..RING_DEPTH {
+            let _ = bulk_bufs.push(alloc.allocate(64).unwrap());
+        }
+        let bulk_ep = ep_alloc
+            .allocate_endpoint(bulk_addr, bulk_bufs, EndpointType::Bulk)
+            .unwrap();
+        assert_eq!(bulk_ep.ring_depth(), RING_DEPTH, "bulk ep ring depth");
+
+        // Control OUT: allocate 1 buffer.
+        let ctrl_addr = EndpointAddress::from(0); // EP0 OUT
+        let mut ctrl_bufs = heapless::Vec::<_, RING_DEPTH>::new();
+        let _ = ctrl_bufs.push(alloc.allocate(8).unwrap());
+        let ctrl_ep = ep_alloc
+            .allocate_endpoint(ctrl_addr, ctrl_bufs, EndpointType::Control)
+            .unwrap();
+        assert_eq!(ctrl_ep.ring_depth(), 1, "control ep ring depth");
     }
 }

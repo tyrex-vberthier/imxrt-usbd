@@ -4,7 +4,7 @@
 //! bus behaviors, so that it could be used separately. However, it's
 //! not yet exposed in the package's API.
 
-use crate::{buffer, gpt, ral};
+use crate::{buffer, gpt, ral, state::RING_DEPTH};
 use usb_device::{
     UsbDirection, UsbError,
     bus::PollResult,
@@ -198,7 +198,10 @@ impl Driver {
     ///
     /// Panics if EP0 OUT isn't allocated.
     pub fn ctrl0_read(&mut self, buffer: &mut [u8]) -> Result<usize, UsbError> {
-        let ctrl_out = self.ep_allocator.endpoint_mut(ctrl_ep0_out()).unwrap();
+        let ctrl_out = self
+            .ep_allocator
+            .endpoint_mut(ctrl_ep0_out())
+            .expect("EP0 OUT must be allocated before ctrl0_read");
         if ctrl_out.has_setup(&self.usb) && buffer.len() >= 8 {
             debug!("EP0 Out SETUP");
             let setup = ctrl_out.read_setup(&self.usb);
@@ -238,7 +241,10 @@ impl Driver {
     ///
     /// Panics if EP0 IN isn't allocated, or if EP0 OUT isn't allocated.
     pub fn ctrl0_write(&mut self, buffer: &[u8]) -> Result<usize, UsbError> {
-        let ctrl_in = self.ep_allocator.endpoint_mut(ctrl_ep0_in()).unwrap();
+        let ctrl_in = self
+            .ep_allocator
+            .endpoint_mut(ctrl_ep0_in())
+            .expect("EP0 IN must be allocated before ctrl0_write");
         debug!("EP0 In {=usize}", buffer.len());
         ctrl_in.check_errors()?;
 
@@ -252,7 +258,10 @@ impl Driver {
         ctrl_in.schedule_transfer(&self.usb, written);
 
         // Might need an OUT schedule for a status phase...
-        let ctrl_out = self.ep_allocator.endpoint_mut(ctrl_ep0_out()).unwrap();
+        let ctrl_out = self
+            .ep_allocator
+            .endpoint_mut(ctrl_ep0_out())
+            .expect("EP0 OUT must be allocated before ctrl0_write");
         if !ctrl_out.is_primed(&self.usb) {
             ctrl_out.clear_complete(&self.usb);
             ctrl_out.clear_nack(&self.usb);
@@ -262,29 +271,33 @@ impl Driver {
         Ok(written)
     }
 
-    /// Read data from an endpoint, and schedule the next transfer
+    /// Read one completed OUT ring slot's data, then re-prime that slot.
+    ///
+    /// Delivers exactly one slot's worth of received bytes per call by draining
+    /// the OUT ring's tail directly (hardware ACTIVE-bit gated), so the Bulk-Only
+    /// read pump can call this repeatedly within a single `poll` and consume every
+    /// packet the controller delivered, exactly once each. Returns `WouldBlock`
+    /// when no completed slot is waiting.
     ///
     /// # Panics
     ///
     /// Panics if the endpoint isn't allocated.
     pub fn ep_read(&mut self, buffer: &mut [u8], addr: EndpointAddress) -> Result<usize, UsbError> {
-        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
-        debug!("EP{=usize} Out", ep.address().index());
+        let ep = self
+            .ep_allocator
+            .endpoint_mut(addr)
+            .expect("ep_read: endpoint must be allocated");
         ep.check_errors()?;
 
-        if ep.is_primed(&self.usb) || (self.ep_out & (1 << ep.address().index()) == 0) {
-            return Err(UsbError::WouldBlock);
-        }
-
-        ep.clear_complete(&self.usb); // Clears self.ep_out bit on the next poll() call...
+        ep.clear_complete(&self.usb);
         ep.clear_nack(&self.usb);
 
-        let read = ep.read(buffer);
-
-        let max_packet_len = ep.max_packet_len();
-        ep.schedule_transfer(&self.usb, max_packet_len);
-
-        Ok(read)
+        // Per-slot OUT delivery: pull the oldest completed slot (if any) and
+        // re-prime it. `None` means the tail slot is still in flight.
+        match ep.read_ring(&self.usb, buffer) {
+            Some(read) => Ok(read),
+            None => Err(UsbError::WouldBlock),
+        }
     }
 
     /// Write data to an endpoint
@@ -293,19 +306,19 @@ impl Driver {
     ///
     /// Panics if the endpoint isn't allocated.
     pub fn ep_write(&mut self, buffer: &[u8], addr: EndpointAddress) -> Result<usize, UsbError> {
-        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+        let ep = self
+            .ep_allocator
+            .endpoint_mut(addr)
+            .expect("ep_write: endpoint must be allocated");
         ep.check_errors()?;
 
-        if ep.is_primed(&self.usb) {
+        if ep.all_busy() {
             return Err(UsbError::WouldBlock);
         }
 
         ep.clear_nack(&self.usb);
 
-        let written = ep.write(buffer);
-        ep.schedule_transfer(&self.usb, written);
-
-        Ok(written)
+        Ok(ep.schedule_next(&self.usb, buffer))
     }
 
     /// Prime a bulk IN transfer of `buf` (host pulls data from the device).
@@ -318,7 +331,10 @@ impl Driver {
     ///
     /// Panics if the endpoint isn't allocated.
     pub fn bulk_ep_write(&mut self, buf: &[u8], addr: EndpointAddress) -> Result<usize, UsbError> {
-        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+        let ep = self
+            .ep_allocator
+            .endpoint_mut(addr)
+            .expect("bulk_ep_write: endpoint must be allocated");
         ep.check_errors()?;
         if ep.is_primed(&self.usb) {
             return Err(UsbError::WouldBlock);
@@ -343,7 +359,10 @@ impl Driver {
         buf: &mut [u8],
         addr: EndpointAddress,
     ) -> Result<(), UsbError> {
-        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+        let ep = self
+            .ep_allocator
+            .endpoint_mut(addr)
+            .expect("bulk_ep_read_prime: endpoint must be allocated");
         ep.check_errors()?;
         // NB: `&` binds looser than `!=`, so the mask compare must be parenthesised.
         if ep.is_primed(&self.usb) || ((self.ep_out & (1 << addr.index())) != 0) {
@@ -367,13 +386,26 @@ impl Driver {
         Some(ep.bulk_bytes_transferred())
     }
 
+    /// Returns `true` when the endpoint's multi-TD ring has no in-flight dTDs.
+    ///
+    /// An unallocated endpoint reports drained (vacuously true). Used by the BOT
+    /// layer to serialize the CSW at command boundaries.
+    pub fn ep_ring_drained(&self, addr: EndpointAddress) -> bool {
+        self.ep_allocator
+            .endpoint(addr)
+            .is_none_or(|ep| ep.ring_drained())
+    }
+
     /// Stall an endpoint
     ///
     /// # Panics
     ///
     /// Panics if the endpoint isn't allocated
     pub fn ep_stall(&mut self, stall: bool, addr: EndpointAddress) {
-        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+        let ep = self
+            .ep_allocator
+            .endpoint_mut(addr)
+            .expect("ep_stall: endpoint must be allocated");
         ep.set_stalled(&self.usb, stall);
 
         // Re-prime any OUT endpoints if we're unstalling. Only prime an *enabled*
@@ -386,8 +418,17 @@ impl Driver {
             && ep.is_enabled(&self.usb)
             && !ep.is_primed(&self.usb)
         {
-            let max_packet_len = ep.max_packet_len();
-            ep.schedule_transfer(&self.usb, max_packet_len);
+            if addr.index() == 0 {
+                // EP0 never uses the ring (ctrl0_read/write drive slot 0 directly);
+                // keep the legacy single-TD prime.
+                let max_packet_len = ep.max_packet_len();
+                ep.schedule_transfer(&self.usb, max_packet_len);
+            } else {
+                // A stall + flush leaves the ring inconsistent with hardware.
+                // Re-sync the bookkeeping, then prime one slot through the ring.
+                ep.reset_ring();
+                ep.schedule_next(&self.usb, &[]);
+            }
         }
     }
 
@@ -399,7 +440,7 @@ impl Driver {
     pub fn is_ep_stalled(&self, addr: EndpointAddress) -> bool {
         self.ep_allocator
             .endpoint(addr)
-            .unwrap()
+            .expect("is_ep_stalled: endpoint must be allocated")
             .is_stalled(&self.usb)
     }
 
@@ -416,12 +457,12 @@ impl Driver {
     pub fn allocate_ep(
         &mut self,
         addr: EndpointAddress,
-        buffer: buffer::Buffer,
+        buffers: heapless::Vec<buffer::Buffer, RING_DEPTH>,
         kind: EndpointType,
     ) {
         self.ep_allocator
-            .allocate_endpoint(addr, buffer, kind)
-            .unwrap();
+            .allocate_endpoint(addr, buffers, kind)
+            .expect("allocate_ep: endpoint already allocated or index out of range");
 
         debug!(
             "ALLOC EP{=usize} {} {}",
@@ -450,8 +491,11 @@ impl Driver {
     fn prime_endpoints(&mut self) {
         for ep in self.ep_allocator.nonzero_endpoints_iter_mut() {
             if ep.is_enabled(&self.usb) && ep.address().direction() == UsbDirection::Out {
-                let max_packet_len = ep.max_packet_len();
-                ep.schedule_transfer(&self.usb, max_packet_len);
+                // Prime through the ring so `in_flight`/`tail` stay coherent with
+                // hardware. A legacy `schedule_transfer` here leaves `in_flight == 0`,
+                // so poll()'s `complete()` never drains the first OUT completion and
+                // `ep_read` returns 0 bytes (the first CBW is lost).
+                ep.schedule_next(&self.usb, &[]);
             }
         }
     }
@@ -475,6 +519,15 @@ impl Driver {
 
         if usbsts & USBSTS::UI::mask != 0 {
             ral::write_reg!(ral::usb, self.usb, USBSTS, UI: 1);
+
+            // Drain completed TDs from all ring endpoints before building PollResult.
+            // Split borrow: ep_allocator and usb are different fields so this compiles.
+            {
+                let usb = &self.usb;
+                for ep in self.ep_allocator.endpoints_iter_mut() {
+                    ep.complete(usb);
+                }
+            }
 
             trace!(
                 "ENDPTSETUPSTAT: {=u32:#010X}  ENDPTCOMPLETE: {=u32:#010X}",
