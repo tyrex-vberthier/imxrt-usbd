@@ -215,6 +215,48 @@ impl Endpoint {
         while ral::read_reg!(ral::usb, usb, ENDPTPRIME) != 0 {}
     }
 
+    /// Prime ONE dTD over `ptr[..size]` (size up to 5 pages ~= 16–20 KiB).
+    ///
+    /// The QH MPS stays 512; the controller auto-splits the dTD into MPS-sized
+    /// USB packets. There are no cache operations here: the consuming firmware
+    /// keeps the L1 D-cache OFF, so `clean_invalidate` is dead weight on this path.
+    ///
+    /// # Safety / ownership contract
+    ///
+    /// `ptr[..size]` must remain valid and unmodified until the transfer
+    /// completes — i.e. until [`bulk_bytes_transferred`](Endpoint::bulk_bytes_transferred)
+    /// is called (which the caller does only after confirming `is_primed` returned
+    /// `false`).
+    pub fn schedule_bulk(&mut self, usb: &ral::AnyUsbInstance, ptr: *mut u8, size: usize) {
+        self.td.set_terminate();
+        self.td.set_buffer(ptr, size);
+        self.td.set_interrupt_on_complete(true);
+        self.td.set_active();
+        // D-cache is OFF in the consuming firmware: NO td.clean_invalidate_dcache /
+        // buffer.clean_invalidate_dcache calls here (they would be dead weight).
+
+        self.qh.overlay_mut().set_next(self.td);
+        self.qh.overlay_mut().clear_status();
+
+        match self.address.direction() {
+            UsbDirection::In => {
+                ral::write_reg!(ral::usb, usb, ENDPTPRIME, PETB: 1 << self.address.index())
+            }
+            UsbDirection::Out => {
+                ral::write_reg!(ral::usb, usb, ENDPTPRIME, PERB: 1 << self.address.index())
+            }
+        }
+        while ral::read_reg!(ral::usb, usb, ENDPTPRIME) != 0 {}
+    }
+
+    /// Returns the number of bytes moved by the most-recently-completed bulk dTD.
+    ///
+    /// Only call this after confirming that `is_primed` returned `false`
+    /// (i.e. the transfer is complete).
+    pub fn bulk_bytes_transferred(&self) -> usize {
+        self.td.bytes_transferred()
+    }
+
     /// Stall or unstall the endpoint
     pub fn set_stalled(&mut self, usb: &ral::AnyUsbInstance, stall: bool) {
         let endptctrl = endpoint_control::register(usb, self.address.index());

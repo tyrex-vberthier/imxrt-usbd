@@ -308,6 +308,65 @@ impl Driver {
         Ok(written)
     }
 
+    /// Prime a bulk IN transfer of `buf` (host pulls data from the device).
+    ///
+    /// Returns `WouldBlock` while a transfer is already in flight.
+    /// The caller must keep `buf` alive and unmodified until
+    /// [`bulk_ep_poll`](Driver::bulk_ep_poll) returns `Some`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the endpoint isn't allocated.
+    pub fn bulk_ep_write(&mut self, buf: &[u8], addr: EndpointAddress) -> Result<usize, UsbError> {
+        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+        ep.check_errors()?;
+        if ep.is_primed(&self.usb) {
+            return Err(UsbError::WouldBlock);
+        }
+        ep.clear_nack(&self.usb);
+        ep.schedule_bulk(&self.usb, buf.as_ptr() as *mut u8, buf.len());
+        Ok(buf.len())
+    }
+
+    /// Prime a bulk OUT transfer into `buf` (host pushes up to `buf.len()` bytes).
+    ///
+    /// Returns `WouldBlock` while a transfer is already in flight or an
+    /// earlier OUT completion has not yet been consumed.
+    /// The caller must keep `buf` alive and unmodified until
+    /// [`bulk_ep_poll`](Driver::bulk_ep_poll) returns `Some`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the endpoint isn't allocated.
+    pub fn bulk_ep_read_prime(
+        &mut self,
+        buf: &mut [u8],
+        addr: EndpointAddress,
+    ) -> Result<(), UsbError> {
+        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+        ep.check_errors()?;
+        // NB: `&` binds looser than `!=`, so the mask compare must be parenthesised.
+        if ep.is_primed(&self.usb) || ((self.ep_out & (1 << addr.index())) != 0) {
+            return Err(UsbError::WouldBlock);
+        }
+        ep.clear_complete(&self.usb);
+        ep.clear_nack(&self.usb);
+        ep.schedule_bulk(&self.usb, buf.as_mut_ptr(), buf.len());
+        Ok(())
+    }
+
+    /// Poll a bulk endpoint for transfer completion.
+    ///
+    /// Returns `Some(bytes_transferred)` once the dTD is done, `None` while
+    /// still in flight.
+    pub fn bulk_ep_poll(&mut self, addr: EndpointAddress) -> Option<usize> {
+        let ep = self.ep_allocator.endpoint_mut(addr)?;
+        if ep.is_primed(&self.usb) {
+            return None;
+        }
+        Some(ep.bulk_bytes_transferred())
+    }
+
     /// Stall an endpoint
     ///
     /// # Panics

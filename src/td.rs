@@ -162,7 +162,7 @@ mod test {
         let mut td = Td::new();
         td.set_terminate();
 
-        let other = u32::max_value() & !(31);
+        let other = !(31u32);
         td.set_next(other as *const _);
         assert_eq!(td.NEXT.read(), other);
     }
@@ -170,21 +170,21 @@ mod test {
     #[test]
     fn status() {
         let mut td = Td::new();
-        ral::write_reg!(super, &mut td, TOKEN, STATUS: u32::max_value());
+        ral::write_reg!(super, &mut td, TOKEN, STATUS: u32::MAX);
         assert_eq!(td.TOKEN.read(), 0b11111111);
     }
 
     #[test]
     fn ioc() {
         let mut td = Td::new();
-        ral::write_reg!(super, &mut td, TOKEN, IOC: u32::max_value());
+        ral::write_reg!(super, &mut td, TOKEN, IOC: u32::MAX);
         assert_eq!(td.TOKEN.read(), 1 << 15);
     }
 
     #[test]
     fn total_bytes() {
         let mut td = Td::new();
-        ral::write_reg!(super, &mut td, TOKEN, TOTAL_BYTES: u32::max_value());
+        ral::write_reg!(super, &mut td, TOKEN, TOTAL_BYTES: u32::MAX);
         assert_eq!(td.TOKEN.read(), 0x7FFF << 16);
     }
 
@@ -199,6 +199,59 @@ mod test {
         for buffer_pointer in td.BUFFER_POINTERS.iter() {
             assert!(buffer_pointer.read() != 0);
         }
+    }
+
+    /// Verify that a page-aligned 16 KiB buffer programs TOTAL_BYTES == 16384
+    /// and that all five BUFFER_POINTERS are consecutive 4 KiB-aligned page
+    /// addresses (each differing from the previous by exactly 4096).
+    #[test]
+    fn set_buffer_16k_spans_four_pages() {
+        const PAGE: usize = 4096;
+        const SIZE: usize = 4 * PAGE; // 16 KiB = 4 × 4096 B
+
+        // Stack-allocate a page-aligned buffer using a repr(align) wrapper.
+        // This avoids std::alloc in a no_std crate while still ensuring the
+        // pointer is 4 KiB-aligned, which makes the page-pointer arithmetic
+        // deterministic.
+        #[repr(align(4096))]
+        struct AlignedBuf([u8; 4 * 4096]);
+        let mut backing = AlignedBuf([0u8; 4 * 4096]);
+        let ptr = backing.0.as_mut_ptr();
+
+        let mut td = Td::new();
+        td.set_buffer(ptr, SIZE);
+
+        // TOTAL_BYTES field must equal 16384.
+        let total_bytes = ral::read_reg!(super, &td, TOKEN, TOTAL_BYTES) as usize;
+        assert_eq!(total_bytes, SIZE, "TOTAL_BYTES should be 16384");
+
+        // bytes_transferred() reports 0 before the transfer actually runs
+        // (last_transfer_size == SIZE and TOTAL_BYTES == SIZE so delta == 0).
+        assert_eq!(td.bytes_transferred(), 0);
+
+        // Collect the five page pointers.
+        let bp: [u32; 5] = core::array::from_fn(|i| td.BUFFER_POINTERS[i].read());
+
+        // All five must be non-zero.
+        for (i, &val) in bp.iter().enumerate() {
+            assert_ne!(val, 0, "BUFFER_POINTERS[{i}] must not be zero");
+        }
+
+        // Each successive pointer must be exactly one page ahead.
+        for i in 0..4 {
+            assert_eq!(
+                bp[i + 1].wrapping_sub(bp[i]),
+                PAGE as u32,
+                "BUFFER_POINTERS[{i}]→[{}] gap must be one page (4096 B)",
+                i + 1
+            );
+        }
+
+        // BP[0] must equal the raw pointer we supplied.
+        assert_eq!(
+            bp[0], ptr as u32,
+            "BUFFER_POINTERS[0] must equal the supplied ptr"
+        );
     }
 }
 

@@ -14,7 +14,7 @@ use crate::gpt;
 use core::cell::RefCell;
 use cortex_m::interrupt::{self, Mutex};
 use usb_device::{
-    UsbDirection,
+    UsbDirection, UsbError,
     bus::{PollResult, UsbBus},
     endpoint::{EndpointAddress, EndpointType},
 };
@@ -276,6 +276,34 @@ impl BusAdapter {
     /// if you call `gpt_mut` again within the `func` callback.
     pub fn gpt_mut<R>(&self, instance: gpt::Instance, func: impl FnOnce(&mut gpt::Gpt) -> R) -> R {
         self.with_usb_mut(|usb| usb.gpt_mut(instance, func))
+    }
+
+    /// Prime a zero-copy bulk IN transfer of `buf` (host pulls data).
+    ///
+    /// The caller must keep `buf` alive and unmodified until
+    /// [`bulk_poll_complete`](BusAdapter::bulk_poll_complete) returns `Some`.
+    ///
+    /// Returns `WouldBlock` while a transfer is already in flight.
+    pub fn bulk_prime_write(&self, ep: EndpointAddress, buf: &[u8]) -> Result<usize, UsbError> {
+        self.with_usb_mut(|usb| usb.bulk_ep_write(buf, ep))
+    }
+
+    /// Prime a zero-copy bulk OUT transfer into `buf` (host pushes data).
+    ///
+    /// The caller must keep `buf` alive and unmodified until
+    /// [`bulk_poll_complete`](BusAdapter::bulk_poll_complete) returns `Some`.
+    ///
+    /// Returns `WouldBlock` while a transfer is already in flight.
+    pub fn bulk_prime_read(&self, ep: EndpointAddress, buf: &mut [u8]) -> Result<(), UsbError> {
+        self.with_usb_mut(|usb| usb.bulk_ep_read_prime(buf, ep))
+    }
+
+    /// Poll a bulk endpoint for transfer completion.
+    ///
+    /// Returns `Some(bytes_transferred)` once the dTD completes, `None` while
+    /// still in flight.
+    pub fn bulk_poll_complete(&self, ep: EndpointAddress) -> Option<usize> {
+        self.with_usb_mut(|usb| usb.bulk_ep_poll(ep))
     }
 }
 
