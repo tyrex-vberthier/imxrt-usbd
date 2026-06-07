@@ -45,6 +45,12 @@
 #![no_std]
 #![warn(unsafe_op_in_unsafe_fn)]
 
+// The unit-test harness links std; `extern crate std` makes `std::boxed::Box`
+// reachable from `#[cfg(test)]` code in this otherwise-no_std crate (used by the
+// register-block test stand-in in endpoint.rs to leak per-call 'static storage).
+#[cfg(test)]
+extern crate std;
+
 #[macro_use]
 mod log;
 

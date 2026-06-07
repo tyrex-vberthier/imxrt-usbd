@@ -403,12 +403,17 @@ impl UsbBus for BusAdapter {
                 usb.ep_write(buf, ep_addr)
             }
             .inspect_err(|&_status| {
-                warn!(
-                    "EP{=usize} {} STATUS {}",
-                    ep_addr.index(),
-                    ep_addr.direction(),
-                    _status
-                );
+                // WouldBlock is normal flow control (transfer still in flight / no free
+                // ring slot), not an error — logging it floods the hot path (e.g. a CDC
+                // OUT endpoint polled every cycle with no data) and skews ISR timing.
+                if !matches!(_status, usb_device::UsbError::WouldBlock) {
+                    warn!(
+                        "EP{=usize} {} STATUS {}",
+                        ep_addr.index(),
+                        ep_addr.direction(),
+                        _status
+                    );
+                }
             })?;
 
             Ok(written)
@@ -427,12 +432,17 @@ impl UsbBus for BusAdapter {
                 usb.ep_read(buf, ep_addr)
             }
             .inspect_err(|&_status| {
-                warn!(
-                    "EP{=usize} {} STATUS {}",
-                    ep_addr.index(),
-                    ep_addr.direction(),
-                    _status
-                );
+                // WouldBlock is normal flow control (no data ready yet), not an error —
+                // logging it floods the hot path (e.g. a CDC OUT endpoint polled every
+                // cycle with no data) and skews ISR timing enough to stall bulk reads.
+                if !matches!(_status, usb_device::UsbError::WouldBlock) {
+                    warn!(
+                        "EP{=usize} {} STATUS {}",
+                        ep_addr.index(),
+                        ep_addr.direction(),
+                        _status
+                    );
+                }
             })?;
 
             Ok(read)

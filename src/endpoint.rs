@@ -35,6 +35,76 @@ use usb_device::{
     endpoint::{EndpointAddress, EndpointType},
 };
 
+/// Data Synchronisation Barrier — flushes the store buffer so all Normal-memory
+/// writes are visible to other bus masters before the subsequent Device-memory
+/// write (ENDPTPRIME) hands the dTD to the USB controller.
+///
+/// In host-side unit tests (x86_64) the Cortex-M assembly intrinsic is absent;
+/// the cfg-gate replaces it with a compiler fence that has equivalent host
+/// ordering semantics for the bookkeeping-only test scaffold.
+#[inline(always)]
+fn dsb() {
+    #[cfg(not(test))]
+    cortex_m::asm::dsb();
+    #[cfg(test)]
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Spin until ENDPTPRIME clears for this endpoint direction+index.
+///
+/// On real hardware the USB controller clears the bit once it has fetched the dTD.
+/// In host-side unit tests there is no hardware, so the bit would never clear and
+/// the spin would loop forever.  The cfg-gate makes it a no-op in test builds;
+/// the bookkeeping (head/in_flight advance) that follows the spin is what matters
+/// for the host-testable behaviour.
+#[inline(always)]
+fn wait_endptprime(usb: &ral::AnyUsbInstance) {
+    #[cfg(not(test))]
+    while ral::read_reg!(ral::usb, usb, ENDPTPRIME) != 0 {}
+    #[cfg(test)]
+    let _ = usb; // suppress unused warning in test builds
+}
+
+/// Spin until ENDPTFLUSH clears for the given mask.
+///
+/// Same rationale as [`wait_endptprime`]: a no-op in test builds.
+#[inline(always)]
+fn wait_endptflush(usb: &ral::AnyUsbInstance, mask: u32) {
+    #[cfg(not(test))]
+    while ral::read_reg!(ral::usb, usb, ENDPTFLUSH) & mask != 0 {}
+    #[cfg(test)]
+    let _ = (usb, mask); // suppress unused warnings in test builds
+}
+
+/// Largest single dTD payload we program: 16 KiB = 4×4 KiB pages, a multiple of
+/// every bulk MPS (8/16/32/64/512), so each dTD completes "full" and the EHCI
+/// queue advances to NEXT autonomously. 16 KiB (not 20 KiB) keeps the 5-pointer
+/// page span valid from any 4-byte-aligned start and divides a 64 KiB chunk evenly.
+const BULK_DTD_MAX: usize = 16 * 1024;
+
+/// Split `size` (>0) bytes into ≤BULK_DTD_MAX dTD payloads, in order.
+///
+/// The `RING_DEPTH` (8) capacity is sufficient iff
+/// `size <= RING_DEPTH × BULK_DTD_MAX` (= 128 KiB), which the firmware guarantees
+/// via a const-assert (SD_CHUNK_BYTES = 64 KiB ⇒ ≤4 dTDs). The `push` is
+/// `debug_assert!`-checked rather than silently dropped so an over-cap input is
+/// loud in debug builds.
+fn chain_layout(size: usize) -> heapless::Vec<usize, RING_DEPTH> {
+    let mut v = heapless::Vec::new();
+    let mut off = 0usize;
+    while off < size {
+        let n = (size - off).min(BULK_DTD_MAX);
+        // The push MUST happen unconditionally: a `debug_assert!(v.push(n)...)`
+        // elides the side-effect in release builds (debug-assertions off), so the
+        // chain comes back empty, schedule_bulk sees n==0 and primes nothing, and
+        // the bulk-OUT transfer retires Some(0) → host reset loop, 0 bytes written.
+        let pushed = v.push(n);
+        debug_assert!(pushed.is_ok(), "chain longer than RING_DEPTH");
+        off += n;
+    }
+    v
+}
+
 /// A USB endpoint with a multi-TD ring per direction.
 pub struct Endpoint {
     address: EndpointAddress,
@@ -50,6 +120,14 @@ pub struct Endpoint {
     tail: usize,
     /// Number of TDs primed but not yet retired (0..=depth()).
     in_flight: u32,
+    /// Number of dTDs in the most recently primed bulk chain (slot 0..bulk_chain_len).
+    /// 0 when no bulk transfer has been primed. Read by `bulk_bytes_transferred`.
+    bulk_chain_len: usize,
+    /// Bytes the OUT ring had already received (read-ahead) and that `schedule_bulk`
+    /// drained into the front of the destination buffer before priming the chain.
+    /// Added to the chain's byte count by `bulk_bytes_transferred` so the transport
+    /// sees the full transfer. 0 for IN and whenever nothing was pre-received.
+    bulk_recovered: usize,
 }
 
 impl Endpoint {
@@ -81,6 +159,8 @@ impl Endpoint {
             head: 0,
             tail: 0,
             in_flight: 0,
+            bulk_chain_len: 0,
+            bulk_recovered: 0,
         }
     }
 
@@ -254,18 +334,37 @@ impl Endpoint {
                 ral::write_reg!(ral::usb, usb, ENDPTPRIME, PERB: 1 << self.address.index())
             }
         }
-        while ral::read_reg!(ral::usb, usb, ENDPTPRIME) != 0 {}
+        wait_endptprime(usb);
     }
 
-    /// Prime ONE dTD over `ptr[..size]` (Lever A big-dTD path, slot 0).
+    /// Flush any primed/in-flight TDs on this endpoint (ENDPTFLUSH), so the QH is
+    /// idle before we re-program the overlay. Used at the ring→bulk transition.
+    fn flush(&self, usb: &ral::AnyUsbInstance) {
+        let bit = 1u32 << self.address.index();
+        let mask = match self.address.direction() {
+            UsbDirection::In => bit << 16, // FETB
+            UsbDirection::Out => bit,      // FERB
+        };
+        ral::write_reg!(ral::usb, usb, ENDPTFLUSH, mask);
+        wait_endptflush(usb, mask);
+    }
+
+    /// Prime a multi-dTD chain over `ptr[..size]` (Lever A big-dTD path).
     ///
-    /// The QH MPS stays 512; the controller auto-splits the dTD into MPS-sized
+    /// Splits `size` into `n = ceil(size / BULK_DTD_MAX)` dTDs of ≤16 KiB each,
+    /// links them via NEXT, terminates and sets IOC on the last, primes once.
+    ///
+    /// Before building the chain, flushes the endpoint and resets the ring so a
+    /// stale ring dTD left primed by the preceding CBW read cannot fight the chain
+    /// for the QH overlay.
+    ///
+    /// The QH MPS stays 512; the controller auto-splits each dTD into MPS-sized
     /// USB packets. There are no cache operations here: the consuming firmware
     /// keeps the L1 D-cache OFF, so `clean_invalidate` is dead weight on this path.
     ///
     /// **Note**: `schedule_bulk` and the multi-TD ring (`schedule_next`/`complete`) are
-    /// mutually exclusive per endpoint at runtime. `schedule_bulk` operates exclusively
-    /// on slot 0 and does not interact with head/tail/in_flight ring bookkeeping.
+    /// mutually exclusive per endpoint at runtime. `schedule_bulk` operates on slots
+    /// 0..n and does not interact with head/tail/in_flight ring bookkeeping.
     ///
     /// # Safety / ownership contract
     ///
@@ -274,12 +373,95 @@ impl Endpoint {
     /// is called (which the caller does only after confirming `is_primed` returned
     /// `false`).
     pub fn schedule_bulk(&mut self, usb: &ral::AnyUsbInstance, ptr: *mut u8, size: usize) {
-        self.tds[0].set_terminate();
-        self.tds[0].set_buffer(ptr, size);
-        self.tds[0].set_interrupt_on_complete(true);
-        self.tds[0].set_active();
-        // D-cache is OFF in the consuming firmware: NO td.clean_invalidate_dcache /
-        // buffer.clean_invalidate_dcache calls here (they would be dead weight).
+        // A zero-length bulk prime is never a valid call: the firmware's scsi_write /
+        // scsi_read early-return on total == 0 before reaching bulk_read_data, so
+        // size is always a positive multiple of the block size here.
+        debug_assert!(size > 0, "schedule_bulk: zero-length bulk prime");
+        // Drop any ring dTD the preceding CBW read left primed on this EP. flush() STOPS
+        // reception (no slot stays primed), which is what makes the drain below race-free.
+        self.flush(usb);
+
+        // Recover read-ahead data the OUT ring already captured before we flushed.
+        //
+        // The OUT endpoint carries both CBWs and (ring build) the WRITE data phase, and
+        // the ring keeps read-ahead slots primed so the next CBW lands without waiting on
+        // a poll. For a WRITE, the host begins the data phase immediately after its CBW,
+        // so its leading 512-byte packets can land in those read-ahead slots in the brief
+        // window between the CBW delivery (which re-primed a slot) and this prime. Those
+        // packets are ACKed on the wire but, without recovery, get discarded by flush() —
+        // the big-dTD chain then receives FEWER bytes than the host sent, its last dTD
+        // never fills, never completes (no IOC), the CSW is never sent, and the host
+        // resets after a ~30 s timeout. The loss count is timing/parity dependent, which
+        // is exactly why the symptom was flaky. flush() has already stopped reception, so
+        // every captured slot is final: drain them (FIFO from tail) into the front of the
+        // destination buffer, then prime the chain for the remainder. Net: chain receives
+        // exactly (size - recovered) bytes and completes cleanly. (OUT only; an IN bulk
+        // EP has no receive ring to drain — its ring stays empty during reads.)
+        let mut recovered = 0usize;
+        if self.address.direction() == UsbDirection::Out {
+            while self.in_flight > 0 && recovered < size {
+                let slot = self.tail;
+                let got = self.tds[slot].bytes_transferred();
+                if got == 0 {
+                    // First read-ahead slot with no captured packet: reception stopped
+                    // here (host data is delivered contiguously from the oldest slot).
+                    break;
+                }
+                let n = got.min(size - recovered);
+                // SAFETY: ptr[..size] is the caller's live buffer; recovered + n <= size.
+                let dst = unsafe { core::slice::from_raw_parts_mut(ptr.add(recovered), n) };
+                self.buffers[slot].volatile_read(dst);
+                recovered += n;
+                self.tail = (slot + 1) % self.depth();
+                self.in_flight -= 1;
+            }
+        }
+
+        // Sync ring bookkeeping so a later read_ring re-arm (post-bulk) starts clean.
+        self.reset_ring();
+        self.bulk_recovered = recovered;
+
+        // Prime the chain for whatever the recovery did not already capture.
+        let chain_ptr = unsafe { ptr.add(recovered) };
+        let chain_size = size - recovered;
+
+        let layout = chain_layout(chain_size); // chain_size may be 0 ⇒ len == 0
+        let n = layout.len();
+        debug_assert!(n <= self.tds.len(), "bulk chain longer than TD pool");
+
+        // chain_size == 0 (⇒ n == 0) means either a caller contract violation (a
+        // zero-length `bulk_read_data`, which the firmware must never issue — the
+        // `size > 0` debug_assert above is compiled out in release) OR the rare case
+        // that the read-ahead recovery already captured the entire transfer. Either
+        // way there is nothing left for the chain: leave the EP idle so `bulk_poll`
+        // retires it as Some(recovered) (= Some(size) when fully recovered) instead
+        // of hard-faulting on the `n - 1` underflow below. flush + reset_ring already
+        // ran, and bulk_recovered is set, so the byte count is correct.
+        if n == 0 {
+            self.bulk_chain_len = 0;
+            return;
+        }
+
+        let mut off = 0usize;
+        for (i, &chunk) in layout.iter().enumerate() {
+            // SAFETY: chain_ptr[..chain_size] is the tail of the caller's buffer (after
+            // the recovered prefix); off < chain_size keeps us in bounds.
+            let slot_ptr = unsafe { chain_ptr.add(off) };
+            self.tds[i].set_buffer(slot_ptr, chunk);
+            self.tds[i].set_interrupt_on_complete(i + 1 == n); // IOC on the last only
+            self.tds[i].set_active();
+            off += chunk;
+        }
+        // Link each dTD to its successor. `1..n` is empty for a single-dTD chain
+        // (n == 1) and never underflows (cf. the former `0..n - 1`, which panicked
+        // when n == 0 under release overflow-checks).
+        for i in 1..n {
+            let next = core::ptr::addr_of!(self.tds[i]);
+            self.tds[i - 1].set_next(next);
+        }
+        self.tds[n - 1].set_terminate();
+        self.bulk_chain_len = n;
+        // D-cache OFF in the consuming firmware: no clean_invalidate here.
 
         self.qh.overlay_mut().set_next(&self.tds[0]);
         self.qh.overlay_mut().clear_status();
@@ -288,11 +470,8 @@ impl Endpoint {
         // ENDPTPRIME is a Device-memory write that makes the controller (a separate
         // AHB bus master) fetch the dTD. ARM permits reordering a Normal-memory
         // store after a Device store, so without a DSB the controller can fetch a
-        // stale dTD before our stores drain from the M7 store buffer. The legacy
-        // `schedule_transfer` got this barrier for free inside `clean_invalidate_dcache`;
-        // dropping the (D-cache-off) cache ops also dropped that DSB, so issue it
-        // explicitly here.
-        cortex_m::asm::dsb();
+        // stale dTD before our stores drain from the M7 store buffer.
+        dsb();
 
         match self.address.direction() {
             UsbDirection::In => {
@@ -302,15 +481,27 @@ impl Endpoint {
                 ral::write_reg!(ral::usb, usb, ENDPTPRIME, PERB: 1 << self.address.index())
             }
         }
-        while ral::read_reg!(ral::usb, usb, ENDPTPRIME) != 0 {}
+        wait_endptprime(usb);
     }
 
-    /// Returns the number of bytes moved by the most-recently-completed bulk dTD.
+    /// Returns the number of bytes moved by the most-recently-completed bulk transfer:
+    /// the read-ahead prefix `schedule_bulk` drained (`bulk_recovered`) plus the sum of
+    /// every dTD in the chain.
     ///
     /// Only call this after confirming that `is_primed` returned `false`
-    /// (i.e. the transfer is complete). Reads from slot 0 (Lever A path).
+    /// (i.e. the transfer is complete).
+    ///
+    /// `bulk_chain_len == 0` and `bulk_recovered == 0` (no bulk ever primed) sum to 0.
     pub fn bulk_bytes_transferred(&self) -> usize {
-        self.tds[0].bytes_transferred()
+        // Caller contract: only call after is_primed() returned false (chain retired).
+        // Sum every dTD in the chain. A dTD that completed full contributes its whole
+        // size; a short-terminated dTD contributes only what arrived; un-started dTDs
+        // contribute 0. So the sum (plus the recovered read-ahead prefix) equals the
+        // bytes the host actually delivered.
+        self.bulk_recovered
+            + (0..self.bulk_chain_len)
+                .map(|i| self.tds[i].bytes_transferred())
+                .sum::<usize>()
     }
 
     // -------------------------------------------------------------------------
@@ -370,7 +561,7 @@ impl Endpoint {
             // the queue, so ENDPTSTAT/ERBR never goes ready and the OUT transfer is
             // lost). The legacy `schedule_transfer` got this DSB for free from its
             // (D-cache-off, otherwise-dead) cache ops; the ring path must issue it.
-            cortex_m::asm::dsb();
+            dsb();
             match self.address.direction() {
                 UsbDirection::In => {
                     ral::write_reg!(ral::usb, usb, ENDPTPRIME, PETB: 1 << ep_index)
@@ -379,14 +570,14 @@ impl Endpoint {
                     ral::write_reg!(ral::usb, usb, ENDPTPRIME, PERB: 1 << ep_index)
                 }
             }
-            while ral::read_reg!(ral::usb, usb, ENDPTPRIME) != 0 {}
+            wait_endptprime(usb);
         } else {
             // QH is active — append to the live chain.
             // Step 1: link previous chain-tail's NEXT to the new TD.
             // Barrier first: the new dTD's payload (set_terminate/buffer/active above)
             // must be visible in SRAM before we publish the pointer to it, or the
             // controller can follow the link and fetch a half-written dTD.
-            cortex_m::asm::dsb();
+            dsb();
             let prev = (slot + self.depth() - 1) % self.depth();
             self.tds[prev].set_next(&self.tds[slot]);
 
@@ -429,7 +620,7 @@ impl Endpoint {
                     self.qh.overlay_mut().clear_status();
                     // Flush overlay stores before the ENDPTPRIME Device write (see the
                     // first-prime branch for the full rationale).
-                    cortex_m::asm::dsb();
+                    dsb();
                     match self.address.direction() {
                         UsbDirection::In => {
                             ral::write_reg!(ral::usb, usb, ENDPTPRIME, PETB: 1 << ep_index)
@@ -438,7 +629,7 @@ impl Endpoint {
                             ral::write_reg!(ral::usb, usb, ENDPTPRIME, PERB: 1 << ep_index)
                         }
                     }
-                    while ral::read_reg!(ral::usb, usb, ENDPTPRIME) != 0 {}
+                    wait_endptprime(usb);
                 }
                 // If ep_active == true: the controller already sees the new TD via
                 // the NEXT link we wrote at step 1. Nothing more to do.
@@ -501,6 +692,17 @@ impl Endpoint {
     pub fn read_ring(&mut self, usb: &ral::AnyUsbInstance, buf: &mut [u8]) -> Option<usize> {
         debug_assert!(self.address.direction() == UsbDirection::Out);
         if self.in_flight == 0 {
+            // Ring empty. If a bulk chain is still primed (post-bulk, not yet retired),
+            // ENDPTSTAT will be set — leave it alone. Otherwise re-arm one receive slot
+            // so the next CBW can land instead of hanging the MSC state machine forever.
+            //
+            // The genuinely-live !is_primed transition (bulk chain just retired, CBW
+            // read follows immediately) is covered by the on-device CBW-after-write gate
+            // in substep 6; this branch is the host-unit-testable self-heal trigger.
+            if !self.is_primed(usb) {
+                self.reset_ring();
+                self.schedule_next(usb, &[]);
+            }
             return None;
         }
         let tail = self.tail;
@@ -534,6 +736,8 @@ impl Endpoint {
         self.head = 0;
         self.tail = 0;
         self.in_flight = 0;
+        self.bulk_chain_len = 0;
+        self.bulk_recovered = 0;
     }
 
     // -------------------------------------------------------------------------
@@ -683,21 +887,32 @@ mod tests {
     // dereference it (complete() currently ignores the argument entirely).
     // -----------------------------------------------------------------------
 
-    /// Return a reference to a zeroed, static register-block stand-in.
+    /// Return a reference to a zeroed register-block stand-in.
     ///
-    /// `complete()` accepts `&ral::AnyUsbInstance` but never dereferences it,
-    /// so a dangling-but-non-null pointer is safe here.  We use `static mut`
-    /// (bypasses the `Sync` requirement on `RegisterBlock`) and obtain a raw
-    /// const pointer via `addr_of!` to satisfy Edition 2024's ban on
-    /// `&*static_mut`.
+    /// `imxrt_ral::Instance<T,N>` is `repr(transparent)` over `NonNull<T>` — it holds
+    /// a *pointer* to a `RegisterBlock`, not the block itself. (An earlier version cast
+    /// `addr_of!(zeroed_block)` directly to `*const Instance`, reinterpreting the first
+    /// word of the zeroed block as a `NonNull` — a null pointer that segfaulted on the
+    /// first `Deref`.)
+    ///
+    /// Each call leaks its OWN zeroed block + `Instance`. That isolation matters: cargo
+    /// runs unit tests on parallel threads, and the priming paths write `ENDPTPRIME` /
+    /// `ENDPTFLUSH` through this pointer — a single shared static block would be a
+    /// cross-thread data race, and an init-once guard would race the reader against the
+    /// writer. Per-call leaking sidesteps both (and dodges the `Instance: !Sync` bound,
+    /// since no instance is ever shared across threads). Leaking is fine in a test binary.
     fn fake_usb() -> &'static imxrt_ral::usb::Instance<255> {
-        static mut FAKE_USB_BLK: imxrt_ral::usb::RegisterBlock =
-            // SAFETY: all-zero is a valid bit pattern for a register block used
-            // only as an address; we never read or write through this in tests.
-            unsafe { core::mem::zeroed() };
-        // SAFETY: addr_of! does not form a reference to the static; the cast is
-        // valid because Instance<N> is repr(transparent) over the register block.
-        unsafe { &*(core::ptr::addr_of!(FAKE_USB_BLK) as *const imxrt_ral::usb::Instance<255>) }
+        // SAFETY: an all-zero RegisterBlock is a valid stand-in (all reads return 0:
+        // ENDPTSTAT == 0 ⇒ is_primed() false). `Instance::new` is unsafe only because it
+        // trusts the pointer; ours points at a freshly-leaked, correctly-typed block.
+        // `std::boxed::Box` (this is a `#![no_std]` crate, but the test harness links std)
+        // gives a true `'static` leak — the per-call isolation the doc comment relies on.
+        let blk: *const imxrt_ral::usb::RegisterBlock =
+            std::boxed::Box::leak(std::boxed::Box::new(unsafe {
+                core::mem::zeroed::<imxrt_ral::usb::RegisterBlock>()
+            }));
+        let inst = unsafe { imxrt_ral::usb::Instance::new(blk) };
+        std::boxed::Box::leak(std::boxed::Box::new(inst))
     }
 
     // -----------------------------------------------------------------------
@@ -832,6 +1047,121 @@ mod tests {
         assert_eq!(ep.head(), 0);
         assert_eq!(ep.tail(), 0);
         assert!(!ep.all_busy());
+    }
+
+    /// Verify that `chain_layout` splits sizes into the correct dTD chunk sequence.
+    #[test]
+    fn bulk_chain_splits_into_dtds() {
+        // 64 KiB → exactly four 16 KiB chunks.
+        assert_eq!(
+            chain_layout(65536).as_slice(),
+            [16384, 16384, 16384, 16384],
+            "64 KiB must split into four 16 KiB chunks"
+        );
+        // 56 KiB → three 16 KiB chunks + one 8 KiB remainder.
+        assert_eq!(
+            chain_layout(57344).as_slice(),
+            [16384, 16384, 16384, 8192],
+            "56 KiB must split into three 16 KiB + one 8 KiB chunk"
+        );
+        // 512 B → single chunk (sub-16 KiB).
+        assert_eq!(
+            chain_layout(512).as_slice(),
+            [512],
+            "512 B must produce a single chunk"
+        );
+        // Exactly 16 KiB → single full chunk.
+        assert_eq!(
+            chain_layout(16384).as_slice(),
+            [16384],
+            "16 KiB must produce a single full chunk"
+        );
+    }
+
+    /// Verify that `bulk_bytes_transferred` sums over a 2-dTD chain correctly.
+    #[test]
+    fn bulk_bytes_transferred_sums_chain() {
+        make_endpoint!(
+            ep,
+            BACKING_BULK,
+            RING_DEPTH,
+            512,
+            UsbDirection::Out,
+            EndpointType::Bulk
+        );
+
+        // Use a static buffer so we have a valid pointer to pass.
+        static mut XFER_BUF: [u8; 32768] = [0u8; 32768];
+        let p: *mut u8 = core::ptr::addr_of_mut!(XFER_BUF) as *mut u8;
+
+        // Slot 0: full 16384 bytes transferred.
+        ep.tds[0].test_set_transferred(p, 16384, 16384);
+        // Slot 1: un-started → 0 bytes transferred.
+        ep.tds[1].test_set_transferred(p, 16384, 0);
+
+        ep.bulk_chain_len = 2;
+
+        assert_eq!(ep.bulk_chain_len, 2);
+        assert_eq!(
+            ep.bulk_bytes_transferred(),
+            16384,
+            "sum must be 16384 (slot 0 full + slot 1 un-started)"
+        );
+    }
+
+    /// After a bulk OUT phase, `read_ring` re-arms the ring when it is empty and
+    /// the endpoint is not currently primed (ENDPTSTAT == 0 in the fake USB block).
+    ///
+    /// Step 1: first `read_ring` call fires `reset_ring` + `schedule_next`, sets slot 0
+    /// ACTIVE, advances head → 1, in_flight → 1, and returns `None`.
+    /// Step 2: second `read_ring` call sees `in_flight == 1` (not the re-arm branch),
+    /// inspects tail TD (slot 0) whose ACTIVE bit was set in step 1, and returns `None`
+    /// without double-priming.
+    #[test]
+    fn read_ring_rearms_empty_unprimed_ring() {
+        make_endpoint!(
+            ep,
+            BACKING_REARM,
+            RING_DEPTH,
+            512,
+            UsbDirection::Out,
+            EndpointType::Bulk
+        );
+
+        // Simulate the post-bulk state: reset_ring leaves in_flight == 0, head == 0,
+        // tail == 0, and every TD's status cleared (no ACTIVE bit).
+        ep.reset_ring();
+        assert_eq!(ep.in_flight(), 0);
+        assert_eq!(ep.head(), 0);
+        assert_eq!(ep.tail(), 0);
+
+        // fake_usb() returns zeroed registers: ENDPTSTAT == 0 → is_primed() == false.
+        // Step 1: re-arm fires, schedule_next sets slot 0 ACTIVE and head → 1, in_flight → 1.
+        let mut buf = [0u8; 512];
+        let result1 = ep.read_ring(fake_usb(), &mut buf);
+        assert!(result1.is_none(), "step 1: must return None (no data yet)");
+        assert_eq!(
+            ep.in_flight(),
+            1,
+            "step 1: in_flight must be 1 after re-arm"
+        );
+        assert_eq!(ep.head(), 1, "step 1: head must advance to 1");
+        assert_eq!(ep.tail(), 0, "step 1: tail must stay at 0");
+
+        // Step 2: in_flight == 1, so re-arm branch is skipped. Slot 0 is still ACTIVE
+        // (set by schedule_next in step 1) → returns None, in_flight unchanged.
+        let result2 = ep.read_ring(fake_usb(), &mut buf);
+        assert!(
+            result2.is_none(),
+            "step 2: must return None (slot still ACTIVE)"
+        );
+        assert_eq!(
+            ep.in_flight(),
+            1,
+            "step 2: no double-prime, in_flight still 1"
+        );
+        assert_eq!(ep.head(), 1, "step 2: head unchanged");
+        assert_eq!(ep.tail(), 0, "step 2: tail unchanged");
     }
 
     /// A depth-1 ring behaves like the legacy single-TD path.

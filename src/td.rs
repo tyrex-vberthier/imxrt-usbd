@@ -145,6 +145,20 @@ mod TOKEN {
     }
 }
 
+impl Td {
+    /// Test helper: set up a dTD as if a transfer of `moved` bytes out of `total`
+    /// completed. After this call, `bytes_transferred()` returns `moved`.
+    ///
+    /// Used by `endpoint.rs` unit tests to verify `bulk_bytes_transferred` sums correctly.
+    #[cfg(test)]
+    pub(crate) fn test_set_transferred(&mut self, ptr: *mut u8, total: usize, moved: usize) {
+        self.set_buffer(ptr, total); // sets last_transfer_size = total, TOTAL_BYTES = total
+        // bytes_transferred() == last_transfer_size - TOTAL_BYTES; we want it to return `moved`,
+        // so we write TOTAL_BYTES = total - moved (the "remaining" bytes).
+        ral::modify_reg!(crate::td, self, TOKEN, TOTAL_BYTES: (total - moved) as u32);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::Td;

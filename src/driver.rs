@@ -346,10 +346,13 @@ impl Driver {
 
     /// Prime a bulk OUT transfer into `buf` (host pushes up to `buf.len()` bytes).
     ///
-    /// Returns `WouldBlock` while a transfer is already in flight or an
-    /// earlier OUT completion has not yet been consumed.
-    /// The caller must keep `buf` alive and unmodified until
-    /// [`bulk_ep_poll`](Driver::bulk_ep_poll) returns `Some`.
+    /// Single-prime protection is owned by the transport layer
+    /// (`BulkOnly::bulk_in_flight` calls this exactly once per data phase), and
+    /// `schedule_bulk` flushes any stale ring dTD the preceding CBW read left primed
+    /// before it re-programs the overlay. So this no longer guards on `is_primed` /
+    /// the `ep_out` completion mask — that guard would block the very first chain prime
+    /// (the ring leaves the OUT EP primed after a CBW read). The caller must keep `buf`
+    /// alive and unmodified until [`bulk_ep_poll`](Driver::bulk_ep_poll) returns `Some`.
     ///
     /// # Panics
     ///
@@ -364,10 +367,6 @@ impl Driver {
             .endpoint_mut(addr)
             .expect("bulk_ep_read_prime: endpoint must be allocated");
         ep.check_errors()?;
-        // NB: `&` binds looser than `!=`, so the mask compare must be parenthesised.
-        if ep.is_primed(&self.usb) || ((self.ep_out & (1 << addr.index())) != 0) {
-            return Err(UsbError::WouldBlock);
-        }
         ep.clear_complete(&self.usb);
         ep.clear_nack(&self.usb);
         ep.schedule_bulk(&self.usb, buf.as_mut_ptr(), buf.len());
@@ -380,10 +379,30 @@ impl Driver {
     /// still in flight.
     pub fn bulk_ep_poll(&mut self, addr: EndpointAddress) -> Option<usize> {
         let ep = self.ep_allocator.endpoint_mut(addr)?;
-        if ep.is_primed(&self.usb) {
+        let primed = ep.is_primed(&self.usb);
+        if primed {
             return None;
         }
-        Some(ep.bulk_bytes_transferred())
+        // Read the completed transfer's byte count BEFORE re-arming: reset_ring() below
+        // zeroes bulk_recovered + bulk_chain_len, which bulk_bytes_transferred sums.
+        let bytes = ep.bulk_bytes_transferred();
+        // Re-arm the OUT ring for the next CBW. A bulk OUT data phase ran via
+        // schedule_bulk, which did reset_ring() and drove the chain off this OUT
+        // endpoint's TD pool; the controller now leaves the endpoint idle with NO ring
+        // receive buffer primed. The host's next CBW arrives on this same endpoint, and
+        // because poll() is interrupt-driven only (USB_OTG1), an unprimed EP NAKs that
+        // CBW, raises no completion interrupt, and nothing re-runs poll to re-arm it —
+        // a hard deadlock the host breaks only with a command timeout + bus reset, on
+        // every write. Re-prime one receive slot now, while we hold the CPU in the
+        // completion ISR and the EP is idle (the host cannot send the next CBW until it
+        // has read the CSW we are about to send), so the CBW lands and the ring pump
+        // resumes. IN bulk endpoints need no re-arm: a read data phase runs schedule_bulk
+        // on the IN endpoint and never tears down the OUT ring.
+        if addr.direction() == UsbDirection::Out {
+            ep.reset_ring();
+            ep.schedule_next(&self.usb, &[]);
+        }
+        Some(bytes)
     }
 
     /// Returns `true` when the endpoint's multi-TD ring has no in-flight dTDs.
