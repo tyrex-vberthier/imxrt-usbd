@@ -82,13 +82,23 @@ fn wait_endptflush(usb: &ral::AnyUsbInstance, mask: u32) {
 /// page span valid from any 4-byte-aligned start and divides a 64 KiB chunk evenly.
 const BULK_DTD_MAX: usize = 16 * 1024;
 
+/// The total payload one full chain can carry: `RING_DEPTH` dTDs × `BULK_DTD_MAX`
+/// (= 128 KiB). `schedule_bulk` clamps oversized inputs to this so an over-cap
+/// transfer truncates (recoverable) instead of relying on an external invariant.
+const CHAIN_MAX_BYTES: usize = RING_DEPTH * BULK_DTD_MAX;
+
 /// Split `size` (>0) bytes into ≤BULK_DTD_MAX dTD payloads, in order.
 ///
 /// The `RING_DEPTH` (8) capacity is sufficient iff
-/// `size <= RING_DEPTH × BULK_DTD_MAX` (= 128 KiB), which the firmware guarantees
-/// via a const-assert (SD_CHUNK_BYTES = 64 KiB ⇒ ≤4 dTDs). The `push` is
-/// `debug_assert!`-checked rather than silently dropped so an over-cap input is
-/// loud in debug builds.
+/// `size <= RING_DEPTH × BULK_DTD_MAX` (= [`CHAIN_MAX_BYTES`], 128 KiB), which the
+/// firmware guarantees via a const-assert (SD_CHUNK_BYTES = 64 KiB ⇒ ≤4 dTDs).
+///
+/// Robustness: if `size` exceeds that — a contract break that lives in *another*
+/// repo and cannot be enforced here — the loop stops once the `heapless::Vec` is
+/// full instead of silently dropping pushes (which in release builds would yield
+/// an inconsistent chain). The `debug_assert` keeps the over-cap input loud in
+/// debug builds; callers should clamp `size` to [`CHAIN_MAX_BYTES`] first so the
+/// returned chain always covers the whole transfer.
 fn chain_layout(size: usize) -> heapless::Vec<usize, RING_DEPTH> {
     let mut v = heapless::Vec::new();
     let mut off = 0usize;
@@ -98,8 +108,12 @@ fn chain_layout(size: usize) -> heapless::Vec<usize, RING_DEPTH> {
         // elides the side-effect in release builds (debug-assertions off), so the
         // chain comes back empty, schedule_bulk sees n==0 and primes nothing, and
         // the bulk-OUT transfer retires Some(0) → host reset loop, 0 bytes written.
-        let pushed = v.push(n);
-        debug_assert!(pushed.is_ok(), "chain longer than RING_DEPTH");
+        if v.push(n).is_err() {
+            // Vec at capacity (over-cap `size`). Saturate: return the chain we have
+            // rather than spin/drop. caller clamps size, so this is belt-and-braces.
+            debug_assert!(false, "chain longer than RING_DEPTH");
+            break;
+        }
         off += n;
     }
     v
@@ -206,8 +220,8 @@ impl Endpoint {
     pub fn check_errors(&self) -> Result<(), UsbError> {
         let status = self.tds[0].status();
         if status.contains(Status::TRANSACTION_ERROR)
-            | status.contains(Status::DATA_BUFFER_ERROR)
-            | status.contains(Status::HALTED)
+            || status.contains(Status::DATA_BUFFER_ERROR)
+            || status.contains(Status::HALTED)
         {
             Err(UsbError::InvalidState)
         } else {
@@ -326,6 +340,16 @@ impl Endpoint {
         self.qh.overlay_mut().clear_status();
         self.qh.clean_invalidate_dcache();
 
+        self.prime(usb);
+    }
+
+    /// Write `ENDPTPRIME` for this endpoint's direction+index and wait for the
+    /// controller to fetch the dTD (no-op wait in host tests).
+    ///
+    /// The caller MUST have published the dTD/overlay stores and issued the
+    /// store-buffer-draining [`dsb`] *before* calling this: `ENDPTPRIME` is a
+    /// Device-memory write that hands the dTD to a separate AHB master.
+    fn prime(&self, usb: &ral::AnyUsbInstance) {
         match self.address.direction() {
             UsbDirection::In => {
                 ral::write_reg!(ral::usb, usb, ENDPTPRIME, PETB: 1 << self.address.index())
@@ -335,6 +359,46 @@ impl Endpoint {
             }
         }
         wait_endptprime(usb);
+    }
+
+    /// Returns `true` if `ENDPTPRIME` is already set for this endpoint's
+    /// direction+index — the controller will pick up an appended dTD on its own.
+    ///
+    /// `ENDPTPRIME` layout: PETB (IN) = bits 16..23, PERB (OUT) = bits 0..7.
+    fn endpoint_busy(&self, usb: &ral::AnyUsbInstance) -> bool {
+        let prime_bit: u32 = match self.address.direction() {
+            UsbDirection::In => 1 << (self.address.index() + 16),
+            UsbDirection::Out => 1 << self.address.index(),
+        };
+        ral::read_reg!(ral::usb, usb, ENDPTPRIME) & prime_bit != 0
+    }
+
+    /// ATDTW tripwire: atomically read whether the EP queue is still active.
+    ///
+    /// Sets the ATDTW bit, reads `ENDPTSTAT`, and only trusts the result if ATDTW
+    /// is still 1 (no controller race occurred); otherwise it retries. This is the
+    /// textbook EHCI "add dTD to a primed/active queue" handshake. Returns `true`
+    /// if the endpoint queue is still active (the appended dTD will be picked up via
+    /// the NEXT link), `false` if it went idle (caller must re-prime).
+    ///
+    /// `ENDPTSTAT` layout: ETBR (IN) = bits 16..23, ERBR (OUT) = bits 0..7.
+    fn endpoint_active(&self, usb: &ral::AnyUsbInstance) -> bool {
+        let stat_bit: u32 = match self.address.direction() {
+            UsbDirection::In => 1 << (self.address.index() + 16),
+            UsbDirection::Out => 1 << self.address.index(),
+        };
+        let mut ep_active;
+        loop {
+            ral::modify_reg!(ral::usb, usb, USBCMD, ATDTW: 1);
+            let endptstat = ral::read_reg!(ral::usb, usb, ENDPTSTAT);
+            ep_active = endptstat & stat_bit != 0;
+            // Only trust the result if ATDTW is still 1 (no race).
+            if ral::read_reg!(ral::usb, usb, USBCMD, ATDTW == 1) {
+                break;
+            }
+        }
+        ral::modify_reg!(ral::usb, usb, USBCMD, ATDTW: 0);
+        ep_active
     }
 
     /// Flush any primed/in-flight TDs on this endpoint (ENDPTFLUSH), so the QH is
@@ -377,75 +441,123 @@ impl Endpoint {
         // scsi_read early-return on total == 0 before reaching bulk_read_data, so
         // size is always a positive multiple of the block size here.
         debug_assert!(size > 0, "schedule_bulk: zero-length bulk prime");
+        // Clamp to what one full chain can carry (RING_DEPTH × BULK_DTD_MAX). The
+        // firmware guarantees size ≤ 128 KiB via a const-assert that lives in another
+        // repo; clamp here so an over-cap input truncates the transfer (recoverable)
+        // instead of building an inconsistent chain in release. See `chain_layout`.
+        let size = size.min(CHAIN_MAX_BYTES);
         // Drop any ring dTD the preceding CBW read left primed on this EP. flush() STOPS
         // reception (no slot stays primed), which is what makes the drain below race-free.
         self.flush(usb);
 
-        // Recover read-ahead data the OUT ring already captured before we flushed.
-        //
-        // The OUT endpoint carries both CBWs and (ring build) the WRITE data phase, and
-        // the ring keeps read-ahead slots primed so the next CBW lands without waiting on
-        // a poll. For a WRITE, the host begins the data phase immediately after its CBW,
-        // so its leading 512-byte packets can land in those read-ahead slots in the brief
-        // window between the CBW delivery (which re-primed a slot) and this prime. Those
-        // packets are ACKed on the wire but, without recovery, get discarded by flush() —
-        // the big-dTD chain then receives FEWER bytes than the host sent, its last dTD
-        // never fills, never completes (no IOC), the CSW is never sent, and the host
-        // resets after a ~30 s timeout. The loss count is timing/parity dependent, which
-        // is exactly why the symptom was flaky. flush() has already stopped reception, so
-        // every captured slot is final: drain them (FIFO from tail) into the front of the
-        // destination buffer, then prime the chain for the remainder. Net: chain receives
-        // exactly (size - recovered) bytes and completes cleanly. (OUT only; an IN bulk
-        // EP has no receive ring to drain — its ring stays empty during reads.)
-        let mut recovered = 0usize;
-        if self.address.direction() == UsbDirection::Out {
-            while self.in_flight > 0 && recovered < size {
-                let slot = self.tail;
-                let got = self.tds[slot].bytes_transferred();
-                if got == 0 {
-                    // First read-ahead slot with no captured packet: reception stopped
-                    // here (host data is delivered contiguously from the oldest slot).
-                    break;
-                }
-                let n = got.min(size - recovered);
-                // SAFETY: ptr[..size] is the caller's live buffer; recovered + n <= size.
-                let dst = unsafe { core::slice::from_raw_parts_mut(ptr.add(recovered), n) };
-                self.buffers[slot].volatile_read(dst);
-                recovered += n;
-                self.tail = (slot + 1) % self.depth();
-                self.in_flight -= 1;
-            }
-        }
+        // SAFETY: ptr[..size] is the caller's live buffer (its ownership contract).
+        let recovered = unsafe { self.drain_readahead(ptr, size) };
 
         // Sync ring bookkeeping so a later read_ring re-arm (post-bulk) starts clean.
         self.reset_ring();
         self.bulk_recovered = recovered;
 
         // Prime the chain for whatever the recovery did not already capture.
+        // SAFETY: chain start lies within ptr[..size]; size - recovered is its length.
         let chain_ptr = unsafe { ptr.add(recovered) };
         let chain_size = size - recovered;
 
-        let layout = chain_layout(chain_size); // chain_size may be 0 ⇒ len == 0
-        let n = layout.len();
-        debug_assert!(n <= self.tds.len(), "bulk chain longer than TD pool");
-
-        // chain_size == 0 (⇒ n == 0) means either a caller contract violation (a
-        // zero-length `bulk_read_data`, which the firmware must never issue — the
-        // `size > 0` debug_assert above is compiled out in release) OR the rare case
-        // that the read-ahead recovery already captured the entire transfer. Either
-        // way there is nothing left for the chain: leave the EP idle so `bulk_poll`
-        // retires it as Some(recovered) (= Some(size) when fully recovered) instead
-        // of hard-faulting on the `n - 1` underflow below. flush + reset_ring already
-        // ran, and bulk_recovered is set, so the byte count is correct.
-        if n == 0 {
+        // chain_size == 0 means either a caller contract violation (a zero-length
+        // `bulk_read_data`, which the firmware must never issue — the `size > 0`
+        // debug_assert above is compiled out in release) OR the rare case that the
+        // read-ahead recovery already captured the entire transfer. Either way there
+        // is nothing left for the chain: leave the EP idle so `bulk_poll` retires it
+        // as Some(recovered) (= Some(size) when fully recovered) instead of priming an
+        // empty chain. flush + reset_ring already ran, and bulk_recovered is set, so
+        // the byte count is correct.
+        // SAFETY: chain_ptr[..chain_size] is the tail of the caller's buffer.
+        if unsafe { !self.build_chain(chain_ptr, chain_size) } {
             self.bulk_chain_len = 0;
             return;
         }
 
+        self.qh.overlay_mut().set_next(&self.tds[0]);
+        self.qh.overlay_mut().clear_status();
+
+        // Barrier: the dTD/overlay writes above land in (bufferable) SRAM, while
+        // ENDPTPRIME is a Device-memory write that makes the controller (a separate
+        // AHB bus master) fetch the dTD. ARM permits reordering a Normal-memory
+        // store after a Device store, so without a DSB the controller can fetch a
+        // stale dTD before our stores drain from the M7 store buffer.
+        dsb();
+
+        self.prime(usb);
+    }
+
+    /// Drain read-ahead data the OUT ring already captured before the `flush()` in
+    /// `schedule_bulk`, into the front of the destination buffer. Returns the byte
+    /// count recovered (0 for an IN endpoint or when nothing was pre-received).
+    ///
+    /// The OUT endpoint carries both CBWs and (ring build) the WRITE data phase, and
+    /// the ring keeps read-ahead slots primed so the next CBW lands without waiting on
+    /// a poll. For a WRITE, the host begins the data phase immediately after its CBW,
+    /// so its leading 512-byte packets can land in those read-ahead slots in the brief
+    /// window between the CBW delivery (which re-primed a slot) and the chain prime.
+    /// Those packets are ACKed on the wire but, without recovery, get discarded by
+    /// flush() — the big-dTD chain then receives FEWER bytes than the host sent, its
+    /// last dTD never fills, never completes (no IOC), the CSW is never sent, and the
+    /// host resets after a ~30 s timeout. The loss count is timing/parity dependent,
+    /// which is exactly why the symptom was flaky. flush() has already stopped
+    /// reception, so every captured slot is final: drain them (FIFO from tail) into
+    /// the front of the destination buffer, then the caller primes the chain for the
+    /// remainder. Net: chain receives exactly (size - recovered) bytes and completes
+    /// cleanly. (OUT only; an IN bulk EP has no receive ring to drain.)
+    ///
+    /// # Safety
+    ///
+    /// `ptr[..size]` must be valid for writes for the duration of the call; the
+    /// recovered prefix is written into `ptr[..recovered]` (recovered ≤ size).
+    /// Caller MUST have already called `flush()` so reception is stopped and every
+    /// captured slot is final.
+    unsafe fn drain_readahead(&mut self, ptr: *mut u8, size: usize) -> usize {
+        if self.address.direction() != UsbDirection::Out {
+            return 0;
+        }
+        let mut recovered = 0usize;
+        while self.in_flight > 0 && recovered < size {
+            let slot = self.tail;
+            let got = self.tds[slot].bytes_transferred();
+            if got == 0 {
+                // First read-ahead slot with no captured packet: reception stopped
+                // here (host data is delivered contiguously from the oldest slot).
+                break;
+            }
+            let n = got.min(size - recovered);
+            // SAFETY: caller guarantees ptr[..size] is live; recovered + n <= size.
+            let dst = unsafe { core::slice::from_raw_parts_mut(ptr.add(recovered), n) };
+            self.buffers[slot].volatile_read(dst);
+            recovered += n;
+            self.tail = (slot + 1) % self.depth();
+            self.in_flight -= 1;
+        }
+        recovered
+    }
+
+    /// Build and activate the dTD chain covering `chain_ptr[..chain_size]` on slots
+    /// `0..n`, link each dTD to its successor, set IOC + terminate on the last, and
+    /// record `bulk_chain_len`. Returns `true` if a chain was built (`chain_size > 0`),
+    /// `false` if `chain_size == 0` (caller leaves the EP idle). Does not prime.
+    ///
+    /// # Safety
+    ///
+    /// `chain_ptr[..chain_size]` must be valid for the lifetime of the transfer (until
+    /// `bulk_bytes_transferred`). Caller MUST have run `reset_ring()` first.
+    unsafe fn build_chain(&mut self, chain_ptr: *mut u8, chain_size: usize) -> bool {
+        let layout = chain_layout(chain_size); // chain_size may be 0 ⇒ len == 0
+        let n = layout.len();
+        debug_assert!(n <= self.tds.len(), "bulk chain longer than TD pool");
+        if n == 0 {
+            return false;
+        }
+
         let mut off = 0usize;
         for (i, &chunk) in layout.iter().enumerate() {
-            // SAFETY: chain_ptr[..chain_size] is the tail of the caller's buffer (after
-            // the recovered prefix); off < chain_size keeps us in bounds.
+            // SAFETY: chain_ptr[..chain_size] is the caller's buffer; off < chain_size.
             let slot_ptr = unsafe { chain_ptr.add(off) };
             self.tds[i].set_buffer(slot_ptr, chunk);
             self.tds[i].set_interrupt_on_complete(i + 1 == n); // IOC on the last only
@@ -462,26 +574,7 @@ impl Endpoint {
         self.tds[n - 1].set_terminate();
         self.bulk_chain_len = n;
         // D-cache OFF in the consuming firmware: no clean_invalidate here.
-
-        self.qh.overlay_mut().set_next(&self.tds[0]);
-        self.qh.overlay_mut().clear_status();
-
-        // Barrier: the dTD/overlay writes above land in (bufferable) SRAM, while
-        // ENDPTPRIME is a Device-memory write that makes the controller (a separate
-        // AHB bus master) fetch the dTD. ARM permits reordering a Normal-memory
-        // store after a Device store, so without a DSB the controller can fetch a
-        // stale dTD before our stores drain from the M7 store buffer.
-        dsb();
-
-        match self.address.direction() {
-            UsbDirection::In => {
-                ral::write_reg!(ral::usb, usb, ENDPTPRIME, PETB: 1 << self.address.index())
-            }
-            UsbDirection::Out => {
-                ral::write_reg!(ral::usb, usb, ENDPTPRIME, PERB: 1 << self.address.index())
-            }
-        }
-        wait_endptprime(usb);
+        true
     }
 
     /// Returns the number of bytes moved by the most-recently-completed bulk transfer:
@@ -526,6 +619,14 @@ impl Endpoint {
     /// `clean_invalidate_dcache` calls.
     pub fn schedule_next(&mut self, usb: &ral::AnyUsbInstance, data: &[u8]) -> usize {
         debug_assert!(!self.all_busy(), "schedule_next called while ring full");
+        // Release-mode safety net: appending to a full ring would overwrite the
+        // oldest in-flight slot and desync head/in_flight (silent ring corruption).
+        // The contract is "caller checks !all_busy() first"; degrade a contract break
+        // to a no-op (callers already treat a 0/WouldBlock return as flow control)
+        // rather than corrupting the ring.
+        if self.all_busy() {
+            return 0;
+        }
 
         let slot = self.head;
         let mps = self.qh.max_packet_len();
@@ -548,98 +649,60 @@ impl Endpoint {
         self.tds[slot].set_active();
         // No cache ops — D-cache is OFF.
 
-        let ep_index = self.address.index();
-
         if self.in_flight == 0 {
-            // QH is idle — first dTD: write directly to overlay and prime.
-            self.qh.overlay_mut().set_next(&self.tds[slot]);
-            self.qh.overlay_mut().clear_status();
-            // Barrier: flush the dTD + overlay stores (bufferable SRAM) before the
-            // ENDPTPRIME Device-memory write hands the dTD to the controller (a
-            // separate AHB master). Without it the controller can fetch a stale dTD
-            // (e.g. a not-yet-terminated NEXT pointer → it follows garbage and halts
-            // the queue, so ENDPTSTAT/ERBR never goes ready and the OUT transfer is
-            // lost). The legacy `schedule_transfer` got this DSB for free from its
-            // (D-cache-off, otherwise-dead) cache ops; the ring path must issue it.
-            dsb();
-            match self.address.direction() {
-                UsbDirection::In => {
-                    ral::write_reg!(ral::usb, usb, ENDPTPRIME, PETB: 1 << ep_index)
-                }
-                UsbDirection::Out => {
-                    ral::write_reg!(ral::usb, usb, ENDPTPRIME, PERB: 1 << ep_index)
-                }
-            }
-            wait_endptprime(usb);
+            self.prime_first(usb, slot);
         } else {
-            // QH is active — append to the live chain.
-            // Step 1: link previous chain-tail's NEXT to the new TD.
-            // Barrier first: the new dTD's payload (set_terminate/buffer/active above)
-            // must be visible in SRAM before we publish the pointer to it, or the
-            // controller can follow the link and fetch a half-written dTD.
-            dsb();
-            let prev = (slot + self.depth() - 1) % self.depth();
-            self.tds[prev].set_next(&self.tds[slot]);
-
-            // Step 2: if ENDPTPRIME is already set for this EP, the controller will
-            // pick up the new dTD automatically — we are done.
-            // ENDPTPRIME layout: PETB (IN) = bits 16..23, PERB (OUT) = bits 0..7.
-            let prime_bit: u32 = match self.address.direction() {
-                UsbDirection::In => 1 << (ep_index + 16),
-                UsbDirection::Out => 1 << ep_index,
-            };
-            let already_priming = ral::read_reg!(ral::usb, usb, ENDPTPRIME) & prime_bit != 0;
-
-            if !already_priming {
-                // Step 3: ATDTW tripwire — atomically check whether the EP is still
-                // active while setting the ATDTW bit.
-                //
-                // ENDPTSTAT layout: ETBR (IN) = bits 16..23, ERBR (OUT) = bits 0..7.
-                // Both use ep_index within their respective half-word.
-                let stat_bit: u32 = match self.address.direction() {
-                    UsbDirection::In => 1 << (ep_index + 16),
-                    UsbDirection::Out => 1 << ep_index,
-                };
-
-                let mut ep_active;
-                loop {
-                    ral::modify_reg!(ral::usb, usb, USBCMD, ATDTW: 1);
-                    // Read ENDPTSTAT while ATDTW is held.
-                    let endptstat = ral::read_reg!(ral::usb, usb, ENDPTSTAT);
-                    ep_active = endptstat & stat_bit != 0;
-                    // Only trust the result if ATDTW is still 1 (no race).
-                    if ral::read_reg!(ral::usb, usb, USBCMD, ATDTW == 1) {
-                        break;
-                    }
-                }
-                ral::modify_reg!(ral::usb, usb, USBCMD, ATDTW: 0);
-
-                if !ep_active {
-                    // EP went idle before the append landed: re-prime from this slot.
-                    self.qh.overlay_mut().set_next(&self.tds[slot]);
-                    self.qh.overlay_mut().clear_status();
-                    // Flush overlay stores before the ENDPTPRIME Device write (see the
-                    // first-prime branch for the full rationale).
-                    dsb();
-                    match self.address.direction() {
-                        UsbDirection::In => {
-                            ral::write_reg!(ral::usb, usb, ENDPTPRIME, PETB: 1 << ep_index)
-                        }
-                        UsbDirection::Out => {
-                            ral::write_reg!(ral::usb, usb, ENDPTPRIME, PERB: 1 << ep_index)
-                        }
-                    }
-                    wait_endptprime(usb);
-                }
-                // If ep_active == true: the controller already sees the new TD via
-                // the NEXT link we wrote at step 1. Nothing more to do.
-            }
+            self.append_to_chain(usb, slot);
         }
 
         self.head = (slot + 1) % self.depth();
         self.in_flight += 1;
 
         written
+    }
+
+    /// First dTD of an idle QH: write `slot` directly into the overlay and prime.
+    fn prime_first(&mut self, usb: &ral::AnyUsbInstance, slot: usize) {
+        self.qh.overlay_mut().set_next(&self.tds[slot]);
+        self.qh.overlay_mut().clear_status();
+        // Barrier: flush the dTD + overlay stores (bufferable SRAM) before the
+        // ENDPTPRIME Device-memory write hands the dTD to the controller (a
+        // separate AHB master). Without it the controller can fetch a stale dTD
+        // (e.g. a not-yet-terminated NEXT pointer → it follows garbage and halts
+        // the queue, so ENDPTSTAT/ERBR never goes ready and the OUT transfer is
+        // lost). The legacy `schedule_transfer` got this DSB for free from its
+        // (D-cache-off, otherwise-dead) cache ops; the ring path must issue it.
+        dsb();
+        self.prime(usb);
+    }
+
+    /// QH is active: link `slot` onto the live chain, handling the EHCI add-dTD race.
+    fn append_to_chain(&mut self, usb: &ral::AnyUsbInstance, slot: usize) {
+        // Step 1: link previous chain-tail's NEXT to the new TD.
+        // Barrier first: the new dTD's payload (set_terminate/buffer/active above)
+        // must be visible in SRAM before we publish the pointer to it, or the
+        // controller can follow the link and fetch a half-written dTD.
+        dsb();
+        let prev = (slot + self.depth() - 1) % self.depth();
+        self.tds[prev].set_next(&self.tds[slot]);
+
+        // Step 2: if ENDPTPRIME is already set for this EP, the controller will
+        // pick up the new dTD automatically — we are done.
+        if self.endpoint_busy(usb) {
+            return;
+        }
+
+        // Step 3: ATDTW tripwire — atomically check whether the EP queue is still
+        // active. If it went idle before the append landed, re-prime from this slot;
+        // otherwise the controller already sees the new TD via the NEXT link above.
+        if !self.endpoint_active(usb) {
+            self.qh.overlay_mut().set_next(&self.tds[slot]);
+            self.qh.overlay_mut().clear_status();
+            // Flush overlay stores before the ENDPTPRIME Device write (see
+            // `prime_first` for the full rationale).
+            dsb();
+            self.prime(usb);
+        }
     }
 
     /// Drain completed **IN** TDs from the ring tail.

@@ -317,6 +317,29 @@ impl BusAdapter {
     }
 }
 
+/// Allocate `depth` endpoint buffers of `max_packet_size` bytes from the driver's
+/// endpoint memory.
+///
+/// `depth <= RING_DEPTH` (the caller derives it from the endpoint type), so the
+/// `heapless::Vec` push never overflows its capacity. Returns
+/// [`UsbError::EndpointMemoryOverflow`] if the backing endpoint memory is exhausted.
+fn alloc_buffers(
+    usb: &mut Driver,
+    depth: usize,
+    max_packet_size: u16,
+) -> usb_device::Result<heapless::Vec<crate::buffer::Buffer, { crate::state::RING_DEPTH }>> {
+    debug_assert!(depth <= crate::state::RING_DEPTH);
+    let mut buffers = heapless::Vec::new();
+    for _ in 0..depth {
+        let buf = usb
+            .allocate_buffer(max_packet_size as usize)
+            .ok_or(usb_device::UsbError::EndpointMemoryOverflow)?;
+        // Cannot fail: depth <= RING_DEPTH == Vec capacity (see debug_assert above).
+        let _ = buffers.push(buf);
+    }
+    Ok(buffers)
+}
+
 impl UsbBus for BusAdapter {
     /// The USB hardware can guarantee that we set the status before we receive
     /// the status, and we're taking advantage of that. We expect this flag to
@@ -345,13 +368,7 @@ impl UsbBus for BusAdapter {
                 if usb.is_allocated(addr) {
                     return Err(usb_device::UsbError::InvalidEndpoint);
                 }
-                let mut buffers = heapless::Vec::<_, { crate::state::RING_DEPTH }>::new();
-                for _ in 0..depth {
-                    let buf = usb
-                        .allocate_buffer(max_packet_size as usize)
-                        .ok_or(usb_device::UsbError::EndpointMemoryOverflow)?;
-                    let _ = buffers.push(buf);
-                }
+                let buffers = alloc_buffers(usb, depth, max_packet_size)?;
                 usb.allocate_ep(addr, buffers, ep_type);
                 Ok(addr)
             } else {
@@ -360,13 +377,7 @@ impl UsbBus for BusAdapter {
                     if usb.is_allocated(addr) {
                         continue;
                     }
-                    let mut buffers = heapless::Vec::<_, { crate::state::RING_DEPTH }>::new();
-                    for _ in 0..depth {
-                        let buf = usb
-                            .allocate_buffer(max_packet_size as usize)
-                            .ok_or(usb_device::UsbError::EndpointMemoryOverflow)?;
-                        let _ = buffers.push(buf);
-                    }
+                    let buffers = alloc_buffers(usb, depth, max_packet_size)?;
                     usb.allocate_ep(addr, buffers, ep_type);
                     return Ok(addr);
                 }

@@ -327,14 +327,14 @@ impl Driver {
     /// The caller must keep `buf` alive and unmodified until
     /// [`bulk_ep_poll`](Driver::bulk_ep_poll) returns `Some`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the endpoint isn't allocated.
+    /// Returns [`UsbError::InvalidEndpoint`] if the endpoint isn't allocated.
     pub fn bulk_ep_write(&mut self, buf: &[u8], addr: EndpointAddress) -> Result<usize, UsbError> {
         let ep = self
             .ep_allocator
             .endpoint_mut(addr)
-            .expect("bulk_ep_write: endpoint must be allocated");
+            .ok_or(UsbError::InvalidEndpoint)?;
         ep.check_errors()?;
         if ep.is_primed(&self.usb) {
             return Err(UsbError::WouldBlock);
@@ -354,9 +354,9 @@ impl Driver {
     /// (the ring leaves the OUT EP primed after a CBW read). The caller must keep `buf`
     /// alive and unmodified until [`bulk_ep_poll`](Driver::bulk_ep_poll) returns `Some`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the endpoint isn't allocated.
+    /// Returns [`UsbError::InvalidEndpoint`] if the endpoint isn't allocated.
     pub fn bulk_ep_read_prime(
         &mut self,
         buf: &mut [u8],
@@ -365,7 +365,7 @@ impl Driver {
         let ep = self
             .ep_allocator
             .endpoint_mut(addr)
-            .expect("bulk_ep_read_prime: endpoint must be allocated");
+            .ok_or(UsbError::InvalidEndpoint)?;
         ep.check_errors()?;
         ep.clear_complete(&self.usb);
         ep.clear_nack(&self.usb);
