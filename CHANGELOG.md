@@ -4,6 +4,11 @@ Changelog
 [Unreleased]
 ------------
 
+[0.4.2] 2026-06-09
+------------------
+
+Don't re-prime a disabled OUT endpoint on unstall.
+
 [0.4.1] 2026-05-16
 ------------------
 
@@ -103,6 +108,7 @@ endpoints.
 First release
 
 [Unreleased]: https://github.com/imxrt-rs/imxrt-usbd/compare/v0.4.0...HEAD
+[0.4.2]: https://github.com/imxrt-rs/imxrt-usbd/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/imxrt-rs/imxrt-usbd/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/imxrt-rs/imxrt-usbd/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/imxrt-rs/imxrt-usbd/compare/v0.2.2...v0.3.0
