@@ -536,11 +536,21 @@ impl Endpoint {
     ) {
         if !self.is_primed(usb) && !self.qh.overlay_mut().status().contains(Status::ACTIVE) {
             // Idle path: write head into QH overlay and prime.
+            trace!(
+                "EP{=usize} {} prime (idle path)",
+                self.address.index(),
+                self.address.direction()
+            );
             self.qh.overlay_mut().set_next(head);
             self.qh.overlay_mut().clear_status();
             dsb();
             self.prime(usb);
         } else {
+            trace!(
+                "EP{=usize} {} append (active path)",
+                self.address.index(),
+                self.address.direction()
+            );
             // Active path: link previous tail onto the new head.
             // Barrier first: all dTD payload writes must be visible before we
             // publish the pointer (controller follows it immediately).
@@ -608,9 +618,32 @@ impl Endpoint {
             return Err(UsbError::InvalidState);
         }
 
+        // Free the budget held by retired fire-and-forget staging records (IN)
+        // before checking it — see `reap_staging_in`.
+        self.reap_staging_in();
+
         let (sizes, count) = chain_layout(len);
 
+        trace!(
+            "EP{=usize} {} submit len={=usize} staging={} q_len={=usize} tds_in_use={=usize} ENDPTPRIME={=u32:#010X} ENDPTSTAT={=u32:#010X}",
+            self.address.index(),
+            self.address.direction(),
+            len,
+            staging_slot.is_some(),
+            self.q_len,
+            self.tds_in_use,
+            ral::read_reg!(ral::usb, usb, ENDPTPRIME),
+            ral::read_reg!(ral::usb, usb, ENDPTSTAT)
+        );
+
         if count > self.tds_free() {
+            trace!(
+                "EP{=usize} {} submit WouldBlock: need {=usize} TDs, free {=usize}",
+                self.address.index(),
+                self.address.direction(),
+                count,
+                self.tds_free()
+            );
             return Err(UsbError::WouldBlock);
         }
 
@@ -674,7 +707,78 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Reap retired fire-and-forget staging records (IN endpoints only).
+    ///
+    /// IN-endpoint staging transfers (the packet path: CSWs, short data packets
+    /// via `ep_write`) are never polled by the class — `write_packet` is
+    /// fire-and-forget. Without reaping they pin the FIFO head and the TD budget
+    /// forever: a later zero-copy `poll_transfer` pops a *stale staging* record
+    /// instead of its own (mis-counting progress), and after `TDS_PER_EP`
+    /// staging writes every submit returns `WouldBlock` (HW-observed: chain MSC
+    /// READ(10) bring-up failure, 2026-06-10).
+    ///
+    /// Pops completed (non-ACTIVE) staging records from the FIFO head; stops at
+    /// the first still-active or zero-copy record (FIFO order preserved). Safe
+    /// for IN: the payload already went to the host. **Never** reaps OUT staging
+    /// records — their buffers hold received data the class must still read via
+    /// `ep_read` (`poll_transfer_with_slot`).
+    ///
+    /// Error bits on a reaped record are dropped with the record: the packet
+    /// path has no per-record error reporting (master surfaced errors via
+    /// `check_errors` on the next call, which still applies to `tds[0]`), and
+    /// endpoint-level recovery (stall/reset) handles the rest.
+    #[cfg(feature = "transfer")]
+    pub(crate) fn reap_staging_in(&mut self) {
+        if self.address.direction() != UsbDirection::In {
+            return;
+        }
+        while self.q_len > 0 {
+            let rec = self.queue[self.q_head];
+            if rec.staging_slot.is_none() {
+                break;
+            }
+            let mut active = false;
+            for i in 0..rec.td_count as usize {
+                let idx = (rec.first_td as usize + i) % crate::state::TDS_PER_EP;
+                if self.tds[idx].status().contains(Status::ACTIVE) {
+                    active = true;
+                    break;
+                }
+            }
+            if active {
+                break;
+            }
+            self.q_head = (self.q_head + 1) % crate::state::TDS_PER_EP;
+            self.q_len -= 1;
+            self.tds_in_use -= rec.td_count as usize;
+            trace!(
+                "EP{=usize} In reaped staging record, q_len={=usize}",
+                self.address.index(),
+                self.q_len
+            );
+        }
+    }
+
+    /// Returns `true` if any packet-path (staging) record is still queued.
+    ///
+    /// Used by `ep_write` to enforce the depth-1 staging rule: a pending staging
+    /// record means the controller still owns the slot-0 staging buffer, so a
+    /// new packet write must `WouldBlock` (master parity via `is_primed`), or it
+    /// would overwrite the in-flight packet's bytes.
+    #[cfg(feature = "transfer")]
+    pub(crate) fn has_pending_staging(&self) -> bool {
+        (0..self.q_len).any(|i| {
+            self.queue[(self.q_head + i) % crate::state::TDS_PER_EP]
+                .staging_slot
+                .is_some()
+        })
+    }
+
     /// Retire the oldest transfer if all its dTDs have completed.
+    ///
+    /// Reaps retired fire-and-forget staging records first (IN endpoints), so a
+    /// zero-copy caller always observes *its own* record's retirement, never a
+    /// stale packet-path record's byte count.
     ///
     /// - `Some(Ok(n))`: `n` bytes actually transferred (≤ `len`; short OUT reads < `len`).
     /// - `Some(Err(_))`: a dTD reported `TRANSACTION_ERROR`, `DATA_BUFFER_ERROR`, or
@@ -682,6 +786,7 @@ impl Endpoint {
     /// - `None`: queue empty or oldest transfer still in flight.
     #[cfg(feature = "transfer")]
     pub fn poll_transfer(&mut self) -> Option<Result<usize, UsbError>> {
+        self.reap_staging_in();
         self.poll_transfer_inner().map(|(result, _slot)| result)
     }
 
@@ -740,6 +845,15 @@ impl Endpoint {
         self.q_head = (self.q_head + 1) % crate::state::TDS_PER_EP;
         self.q_len -= 1;
         self.tds_in_use -= rec.td_count as usize;
+
+        trace!(
+            "EP{=usize} {} retired n={=usize} staging={} q_len={=usize}",
+            self.address.index(),
+            self.address.direction(),
+            total,
+            rec.staging_slot.is_some(),
+            self.q_len
+        );
 
         Some((Ok(total), rec.staging_slot))
     }
@@ -1736,6 +1850,201 @@ mod tests {
             ep.pending_transfers(),
             0,
             "queue must be empty after all retires"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: build an 8-slot IN Bulk endpoint (mirror of make_bulk_ep_and_buf).
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "transfer")]
+    fn make_bulk_in_ep_and_buf(
+        mps: usize,
+        buf_len: usize,
+    ) -> (std::boxed::Box<Endpoint>, std::vec::Vec<u8>) {
+        use crate::state::TDS_PER_EP;
+
+        let qh: &'static mut crate::qh::Qh =
+            std::boxed::Box::leak(std::boxed::Box::new(crate::qh::Qh::new()));
+        let tds: &'static mut [Td] = {
+            let v: std::vec::Vec<Td> = (0..TDS_PER_EP).map(|_| Td::new()).collect();
+            std::boxed::Box::leak(v.into_boxed_slice())
+        };
+        let mut backing: std::vec::Vec<u8> = std::vec![0u8; mps];
+        let mut alloc = unsafe {
+            crate::buffer::Allocator::from_buffer(core::slice::from_raw_parts_mut(
+                backing.as_mut_ptr(),
+                mps,
+            ))
+        };
+        let buf = alloc.allocate(mps).unwrap();
+        std::mem::forget(backing);
+
+        let ep = Endpoint::new(
+            usb_device::endpoint::EndpointAddress::from_parts(3, UsbDirection::In),
+            qh,
+            tds,
+            buf,
+            EndpointType::Bulk,
+        );
+
+        let dummy: std::vec::Vec<u8> = std::vec![0u8; buf_len];
+        (std::boxed::Box::new(ep), dummy)
+    }
+
+    // -----------------------------------------------------------------------
+    // 4a. unpolled_staging_in_writes_do_not_shadow_zero_copy_poll
+    //
+    // Regression for the chain MSC READ(10) failure (HW, 2026-06-10), cycle 1:
+    // the BOT packet path fires-and-forgets staging IN transfers (INQUIRY data,
+    // CSW×3, READ CAPACITY data = 5 records, each retired by the host, never
+    // polled by the class). The class then submits its zero-copy 512 B data
+    // phase and polls for it. Pre-fix, poll_transfer popped the FIFO head — the
+    // stale 36 B INQUIRY-data record — so the class booked 36/512 bytes and the
+    // command hung forever (host reset after 30 s).
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "transfer")]
+    #[test]
+    fn unpolled_staging_in_writes_do_not_shadow_zero_copy_poll() {
+        let usb = fake_usb();
+        let (mut ep, mut dummy) = make_bulk_in_ep_and_buf(512, 512);
+
+        // The exact pre-READ(10) staging IN sequence from the failing trace:
+        // INQUIRY data (36), INQUIRY CSW (13), TUR CSW (13), READ CAP data (8),
+        // READ CAP CSW (13). Each retires on the wire before the next write
+        // (host consumed it), and the class NEVER polls any of them.
+        for len in [36usize, 13, 13, 8, 13] {
+            let ptr = ep.staging_buf_ptr(0);
+            ep.submit_inner(usb, ptr, len, Some(0))
+                .expect("staging submit must succeed");
+            // Hardware retires the staging transfer (host read it all).
+            let td_idx = {
+                let rec = ep.queue[(ep.q_head + ep.q_len - 1) % crate::state::TDS_PER_EP];
+                rec.first_td as usize
+            };
+            ep.tds[td_idx].force_complete(0);
+        }
+
+        // Zero-copy data phase: submit 512 B, hardware retires it.
+        ep.submit_transfer(usb, dummy.as_mut_ptr(), 512)
+            .expect("zero-copy submit must succeed");
+        // Find the zero-copy record's TD (the newest record).
+        let zc_td = {
+            let rec = ep.queue[(ep.q_head + ep.q_len - 1) % crate::state::TDS_PER_EP];
+            rec.first_td as usize
+        };
+        ep.tds[zc_td].force_complete(0);
+
+        // The class polls for ITS transfer: it must observe the 512 B
+        // zero-copy retirement, not a stale staging record's byte count.
+        let polled = ep.poll_transfer();
+        assert_eq!(
+            polled,
+            Some(Ok(512)),
+            "poll_transfer must retire the zero-copy record (512 B), not a stale staging record"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4b. unreaped_staging_in_records_do_not_exhaust_budget
+    //
+    // Regression for cycle 2 of the same failure: after the host's bus reset,
+    // 8 staging IN transfers (MODE SENSE data/CSW ×2, TUR CSW ×2, READ CAP
+    // data+CSW) retire on the wire but are never polled; with TDS_PER_EP == 8
+    // the next zero-copy submit returned WouldBlock forever and the firmware
+    // wedged in an ISR loop. Retired staging records must be reaped so the
+    // budget frees itself.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "transfer")]
+    #[test]
+    fn unreaped_staging_in_records_do_not_exhaust_budget() {
+        use crate::state::TDS_PER_EP;
+        let usb = fake_usb();
+        let (mut ep, mut dummy) = make_bulk_in_ep_and_buf(512, 512);
+
+        // TDS_PER_EP staging writes, each retired by the host, never polled.
+        for _ in 0..TDS_PER_EP {
+            let ptr = ep.staging_buf_ptr(0);
+            ep.submit_inner(usb, ptr, 13, Some(0))
+                .expect("staging submit must succeed while records are reapable");
+            let td_idx = {
+                let rec = ep.queue[(ep.q_head + ep.q_len - 1) % TDS_PER_EP];
+                rec.first_td as usize
+            };
+            ep.tds[td_idx].force_complete(0);
+        }
+
+        // The zero-copy data submit must succeed: every staging record above
+        // has retired, so the budget must be reclaimable.
+        ep.submit_transfer(usb, dummy.as_mut_ptr(), 512)
+            .expect("zero-copy submit must succeed after staging records retired");
+    }
+
+    // -----------------------------------------------------------------------
+    // 4c. pending_staging_blocks_next_packet_write
+    //
+    // Depth-1 packet rule backing Driver::ep_write_queued: while a staging IN
+    // record is still ACTIVE (controller owns the slot-0 buffer), reap must NOT
+    // pop it and has_pending_staging() must hold (→ ep_write WouldBlocks instead
+    // of overwriting the in-flight packet). Once it retires, reap frees it.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "transfer")]
+    #[test]
+    fn pending_staging_blocks_next_packet_write() {
+        use crate::state::TDS_PER_EP;
+        let usb = fake_usb();
+        let (mut ep, _) = make_bulk_in_ep_and_buf(512, 0);
+
+        let ptr = ep.staging_buf_ptr(0);
+        ep.submit_inner(usb, ptr, 13, Some(0))
+            .expect("staging submit");
+
+        // Still ACTIVE: not reapable, still pending.
+        ep.reap_staging_in();
+        assert!(
+            ep.has_pending_staging(),
+            "an in-flight staging record must report pending"
+        );
+        assert_eq!(ep.tds_free(), TDS_PER_EP - 1);
+
+        // Hardware retires it.
+        ep.tds[0].force_complete(0);
+        ep.reap_staging_in();
+        assert!(
+            !ep.has_pending_staging(),
+            "a retired staging record must be reaped"
+        );
+        assert_eq!(ep.tds_free(), TDS_PER_EP, "budget must be fully restored");
+    }
+
+    // -----------------------------------------------------------------------
+    // 4d. out_staging_records_are_never_reaped
+    //
+    // OUT staging buffers hold *received* data the class must still read via
+    // ep_read; reap_staging_in must be a no-op for OUT endpoints.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "transfer")]
+    #[test]
+    fn out_staging_records_are_never_reaped() {
+        let usb = fake_usb();
+        let (mut ep, _) = make_bulk_ep_and_buf(64, 0);
+
+        let mps = ep.max_packet_len();
+        let ptr = ep.staging_buf_ptr(0);
+        ep.submit_inner(usb, ptr, mps, Some(0))
+            .expect("OUT staging submit");
+        ep.tds[0].force_complete(mps - 31);
+
+        // Reap must not touch the retired OUT staging record.
+        ep.reap_staging_in();
+        assert_eq!(
+            ep.pending_transfers(),
+            1,
+            "retired OUT staging record must survive reap (class reads it via ep_read)"
+        );
+        let r = ep.poll_transfer_with_slot();
+        assert!(
+            matches!(r, Some((Ok(31), Some(0)))),
+            "OUT staging record must still be deliverable, got {r:?}"
         );
     }
 

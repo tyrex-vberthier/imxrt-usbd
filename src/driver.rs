@@ -467,7 +467,16 @@ impl Driver {
         let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
         ep.check_errors()?;
 
-        if ep.tds_free() == 0 {
+        // Reap retired fire-and-forget staging records so they don't pin the
+        // FIFO head / TD budget (the class never polls its packet writes).
+        ep.reap_staging_in();
+
+        // Depth-1 staging rule: while a staging packet is still queued, the
+        // controller owns the slot-0 staging buffer — a new write would
+        // overwrite the in-flight packet (master parity: `is_primed` →
+        // WouldBlock). Zero-copy records don't block the packet path beyond
+        // the TD budget.
+        if ep.has_pending_staging() || ep.tds_free() == 0 {
             return Err(UsbError::WouldBlock);
         }
 

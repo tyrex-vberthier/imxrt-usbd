@@ -445,12 +445,22 @@ impl UsbBus for BusAdapter {
                 usb.ep_write(buf, ep_addr)
             }
             .inspect_err(|&_status| {
-                warn!(
-                    "EP{=usize} {} STATUS {}",
-                    ep_addr.index(),
-                    ep_addr.direction(),
-                    _status
-                );
+                // WouldBlock is the designed not-ready return on the hot path
+                // (polled every loop) — keep it at TRACE so it cannot flood.
+                if matches!(_status, usb_device::UsbError::WouldBlock) {
+                    trace!(
+                        "EP{=usize} {} STATUS WouldBlock",
+                        ep_addr.index(),
+                        ep_addr.direction()
+                    );
+                } else {
+                    warn!(
+                        "EP{=usize} {} STATUS {}",
+                        ep_addr.index(),
+                        ep_addr.direction(),
+                        _status
+                    );
+                }
             })?;
 
             Ok(written)
@@ -469,12 +479,22 @@ impl UsbBus for BusAdapter {
                 usb.ep_read(buf, ep_addr)
             }
             .inspect_err(|&_status| {
-                warn!(
-                    "EP{=usize} {} STATUS {}",
-                    ep_addr.index(),
-                    ep_addr.direction(),
-                    _status
-                );
+                // WouldBlock is the designed nothing-to-read return on the hot
+                // path (polled every loop) — TRACE, not WARN (no flood).
+                if matches!(_status, usb_device::UsbError::WouldBlock) {
+                    trace!(
+                        "EP{=usize} {} STATUS WouldBlock",
+                        ep_addr.index(),
+                        ep_addr.direction()
+                    );
+                } else {
+                    warn!(
+                        "EP{=usize} {} STATUS {}",
+                        ep_addr.index(),
+                        ep_addr.direction(),
+                        _status
+                    );
+                }
             })?;
 
             Ok(read)
