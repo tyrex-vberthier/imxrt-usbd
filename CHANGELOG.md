@@ -4,6 +4,19 @@ Changelog
 [Unreleased]
 ------------
 
+Add the `transfer` feature: a per-endpoint queue of sized dTD-chain transfers
+for bulk/interrupt endpoints.
+
+- `BusAdapter::submit_write` / `submit_read` queue zero-copy IN/OUT transfers.
+- `BusAdapter::poll_transfer` retires the oldest completed transfer.
+- `BusAdapter::pending_transfers` counts in-flight transfers on an endpoint.
+- `BusAdapter::set_packet_queue_depth` configures eager OUT packet read-ahead.
+- The packet path (`UsbBus::read` / `write`) is re-expressed over staging
+  buffers under the feature; without the feature the build is behaviorally
+  identical to the previous release.
+- Bus reset and endpoint enable flush the software-side transfer queue on all
+  non-control endpoints (feature-gated).
+
 [0.4.2] 2026-06-09
 ------------------
 

@@ -184,6 +184,13 @@ impl Driver {
         );
         debug!("RESET");
 
+        // Under the transfer feature, clear the software-side queue state on
+        // every non-control endpoint so stale records don't survive across resets.
+        #[cfg(feature = "transfer")]
+        for ep in self.ep_allocator.nonzero_endpoints_iter_mut() {
+            ep.clear_transfers(&self.usb);
+        }
+
         self.initialize_endpoints();
     }
 
@@ -268,23 +275,30 @@ impl Driver {
     ///
     /// Panics if the endpoint isn't allocated.
     pub fn ep_read(&mut self, buffer: &mut [u8], addr: EndpointAddress) -> Result<usize, UsbError> {
-        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
-        debug!("EP{=usize} Out", ep.address().index());
-        ep.check_errors()?;
-
-        if ep.is_primed(&self.usb) || (self.ep_out & (1 << ep.address().index()) == 0) {
-            return Err(UsbError::WouldBlock);
+        #[cfg(feature = "transfer")]
+        {
+            self.ep_read_queued(buffer, addr)
         }
+        #[cfg(not(feature = "transfer"))]
+        {
+            let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+            debug!("EP{=usize} Out", ep.address().index());
+            ep.check_errors()?;
 
-        ep.clear_complete(&self.usb); // Clears self.ep_out bit on the next poll() call...
-        ep.clear_nack(&self.usb);
+            if ep.is_primed(&self.usb) || (self.ep_out & (1 << ep.address().index()) == 0) {
+                return Err(UsbError::WouldBlock);
+            }
 
-        let read = ep.read(buffer);
+            ep.clear_complete(&self.usb); // Clears self.ep_out bit on the next poll() call...
+            ep.clear_nack(&self.usb);
 
-        let max_packet_len = ep.max_packet_len();
-        ep.schedule_transfer(&self.usb, max_packet_len);
+            let read = ep.read(buffer);
 
-        Ok(read)
+            let max_packet_len = ep.max_packet_len();
+            ep.schedule_transfer(&self.usb, max_packet_len);
+
+            Ok(read)
+        }
     }
 
     /// Write data to an endpoint
@@ -293,19 +307,26 @@ impl Driver {
     ///
     /// Panics if the endpoint isn't allocated.
     pub fn ep_write(&mut self, buffer: &[u8], addr: EndpointAddress) -> Result<usize, UsbError> {
-        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
-        ep.check_errors()?;
-
-        if ep.is_primed(&self.usb) {
-            return Err(UsbError::WouldBlock);
+        #[cfg(feature = "transfer")]
+        {
+            self.ep_write_queued(buffer, addr)
         }
+        #[cfg(not(feature = "transfer"))]
+        {
+            let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+            ep.check_errors()?;
 
-        ep.clear_nack(&self.usb);
+            if ep.is_primed(&self.usb) {
+                return Err(UsbError::WouldBlock);
+            }
 
-        let written = ep.write(buffer);
-        ep.schedule_transfer(&self.usb, written);
+            ep.clear_nack(&self.usb);
 
-        Ok(written)
+            let written = ep.write(buffer);
+            ep.schedule_transfer(&self.usb, written);
+
+            Ok(written)
+        }
     }
 
     /// Stall an endpoint
@@ -322,14 +343,290 @@ impl Driver {
         // in its reset() before SET_CONFIGURATION enables endpoints) leaves a stale
         // transfer descriptor that the controller never completes once the endpoint
         // is later enabled.
-        if !stall
-            && addr.direction() == UsbDirection::Out
-            && ep.is_enabled(&self.usb)
-            && !ep.is_primed(&self.usb)
-        {
-            let max_packet_len = ep.max_packet_len();
-            ep.schedule_transfer(&self.usb, max_packet_len);
+        if !stall && addr.direction() == UsbDirection::Out && ep.is_enabled(&self.usb) {
+            #[cfg(feature = "transfer")]
+            {
+                // Under the transfer feature: eager (depth>1) endpoints re-prime
+                // their staging transfers on unstall. Depth-1 (lazy) endpoints stay
+                // lazy — they never have a standing prime outside of an ep_read call.
+                if ep.packet_depth() > 1 && !ep.is_primed(&self.usb) {
+                    let depth = ep.packet_depth();
+                    let mps = ep.max_packet_len();
+                    for slot in 0..depth {
+                        if ep.buffers[slot].is_some() {
+                            let ptr = ep.staging_buf_ptr(slot);
+                            // submit_inner returns WouldBlock if TD budget is full;
+                            // ignore in this recovery path — we prime what fits.
+                            let _ = ep.submit_inner(&self.usb, ptr, mps, Some(slot as u8));
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "transfer"))]
+            {
+                if !ep.is_primed(&self.usb) {
+                    let max_packet_len = ep.max_packet_len();
+                    ep.schedule_transfer(&self.usb, max_packet_len);
+                }
+            }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Transfer-queue packet path (feature = "transfer")
+    // -------------------------------------------------------------------------
+
+    /// Queue-backed `ep_read` (OUT, non-control endpoints).
+    ///
+    /// Lazy/eager rule:
+    /// - `poll_transfer` inner: ack ENDPTCOMPLETE before inspecting TD status.
+    /// - `Some(Ok(n))` with a `staging_slot`: copy bytes from the staging buffer,
+    ///   re-prime if `packet_depth > 1`.
+    /// - `None` and queue empty: lazy prime (depth-1) or already primed (depth>1).
+    /// - `None` with pending transfers: WouldBlock, no new prime.
+    #[cfg(feature = "transfer")]
+    fn ep_read_queued(
+        &mut self,
+        buffer: &mut [u8],
+        addr: EndpointAddress,
+    ) -> Result<usize, UsbError> {
+        debug_assert!(
+            addr.index() != 0,
+            "ep_read_queued must not be called on EP0"
+        );
+        if addr.index() == 0 {
+            return Err(UsbError::InvalidEndpoint);
+        }
+
+        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+        debug!("EP{=usize} Out (queued)", ep.address().index());
+        ep.check_errors()?;
+
+        // clear_nack at entry (master does it before polling).
+        ep.clear_nack(&self.usb);
+
+        // Ack ENDPTCOMPLETE before inspecting TD status.
+        ep.clear_complete(&self.usb);
+
+        match ep.poll_transfer_with_slot() {
+            Some((Ok(n), Some(slot))) => {
+                // Packet-path (staging) transfer retired. Copy bytes out.
+                let n_out = n.min(buffer.len());
+                ep.staging(slot as usize)
+                    .volatile_read(&mut buffer[..n_out]);
+
+                // Eager: re-prime this slot's staging buffer immediately.
+                let depth = ep.packet_depth();
+                if depth > 1 {
+                    let mps = ep.max_packet_len();
+                    let ptr = ep.staging_buf_ptr(slot as usize);
+                    let _ = ep.submit_inner(&self.usb, ptr, mps, Some(slot));
+                }
+
+                Ok(n_out)
+            }
+            Some((Ok(_), None)) => {
+                // Zero-copy transfer at the head while class calls ep_read — the
+                // class mixed packet reads with a zero-copy data phase.
+                debug_assert!(
+                    false,
+                    "ep_read retired a zero-copy transfer; class mixed packet and zero-copy I/O"
+                );
+                Err(UsbError::InvalidState)
+            }
+            Some((Err(e), _)) => Err(e),
+            None => {
+                // Queue empty (or oldest still in flight).
+                if ep.pending_transfers() == 0 {
+                    // Lazy prime: submit one 1-packet staging transfer.
+                    let mps = ep.max_packet_len();
+                    let ptr = ep.staging_buf_ptr(0);
+                    ep.submit_inner(&self.usb, ptr, mps, Some(0))?;
+                }
+                // Either we just primed or there's already something in flight.
+                Err(UsbError::WouldBlock)
+            }
+        }
+    }
+
+    /// Queue-backed `ep_write` (IN, non-control endpoints).
+    ///
+    /// Copies `buffer` into the staging buffer for the next free slot and
+    /// submits a 1-packet staging transfer. Returns `WouldBlock` when the TD
+    /// budget is full (depth-1 = second write before first retires).
+    #[cfg(feature = "transfer")]
+    fn ep_write_queued(&mut self, buffer: &[u8], addr: EndpointAddress) -> Result<usize, UsbError> {
+        debug_assert!(
+            addr.index() != 0,
+            "ep_write_queued must not be called on EP0"
+        );
+        if addr.index() == 0 {
+            return Err(UsbError::InvalidEndpoint);
+        }
+
+        let ep = self.ep_allocator.endpoint_mut(addr).unwrap();
+        ep.check_errors()?;
+
+        if ep.tds_free() == 0 {
+            return Err(UsbError::WouldBlock);
+        }
+
+        ep.clear_nack(&self.usb);
+
+        // Pick the next free staging slot (slot 0 always exists; multi-depth
+        // uses slots round-robin via q_len, but for IN we just use slot 0 always
+        // since IN is not primed ahead).
+        let slot = 0usize;
+        let written = {
+            let buf = ep.staging_mut(slot);
+            let written = buf.volatile_write(&buffer[..buffer.len().min(buf.len())]);
+            let mps = buf.len();
+            buf.clean_invalidate_dcache(mps);
+            written
+        };
+        let ptr = ep.staging_buf_ptr(slot);
+        ep.submit_inner(&self.usb, ptr, written, Some(slot as u8))?;
+
+        Ok(written)
+    }
+
+    // -------------------------------------------------------------------------
+    // Transfer-queue public API (feature = "transfer")
+    // -------------------------------------------------------------------------
+
+    /// Queue a zero-copy IN or OUT transfer on a non-control endpoint.
+    ///
+    /// Zero-copy: the memory at `ptr[..len]` must remain valid and untouched
+    /// until `ep_poll_transfer` retires it.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Panics in debug builds if called on EP0.
+    #[cfg(feature = "transfer")]
+    pub fn ep_submit(
+        &mut self,
+        addr: EndpointAddress,
+        ptr: *mut u8,
+        len: usize,
+    ) -> Result<(), UsbError> {
+        debug_assert!(addr.index() != 0, "ep_submit must not be called on EP0");
+        if addr.index() == 0 {
+            return Err(UsbError::InvalidEndpoint);
+        }
+        let ep = self
+            .ep_allocator
+            .endpoint_mut(addr)
+            .ok_or(UsbError::InvalidEndpoint)?;
+        ep.submit_transfer(&self.usb, ptr, len)
+    }
+
+    /// Retire the oldest completed transfer on `addr`, if any.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Panics in debug builds if called on EP0.
+    #[cfg(feature = "transfer")]
+    pub fn ep_poll_transfer(&mut self, addr: EndpointAddress) -> Option<Result<usize, UsbError>> {
+        debug_assert!(
+            addr.index() != 0,
+            "ep_poll_transfer must not be called on EP0"
+        );
+        if addr.index() == 0 {
+            return Some(Err(UsbError::InvalidEndpoint));
+        }
+        // Ack ENDPTCOMPLETE before inspecting TD status (per spec: substep 3b).
+        if let Some(ep) = self.ep_allocator.endpoint_mut(addr) {
+            ep.clear_complete(&self.usb);
+            ep.poll_transfer()
+        } else {
+            Some(Err(UsbError::InvalidEndpoint))
+        }
+    }
+
+    /// Number of queued (not yet retired) transfers on `addr`.
+    #[cfg(feature = "transfer")]
+    pub fn ep_pending_transfers(&self, addr: EndpointAddress) -> usize {
+        if addr.index() == 0 {
+            return 0;
+        }
+        self.ep_allocator
+            .endpoint(addr)
+            .map(|ep| ep.pending_transfers())
+            .unwrap_or(0)
+    }
+
+    /// Allocate `depth - 1` extra max-packet staging buffers for `addr` and keep
+    /// `depth` 1-packet OUT transfers primed through the packet path (eager
+    /// read-ahead). Call after `UsbDevice` configuration, before traffic.
+    ///
+    /// `depth` must be ≥ 1. Only valid for OUT non-control endpoints; returns
+    /// `Err(UsbError::InvalidEndpoint)` for IN or EP0.
+    ///
+    /// If the endpoint memory pool is exhausted mid-fill, returns
+    /// `Err(UsbError::EndpointMemoryOverflow)`; already-allocated slots remain
+    /// allocated but unused beyond the previous depth.
+    #[cfg(feature = "transfer")]
+    pub fn set_packet_queue_depth(
+        &mut self,
+        addr: EndpointAddress,
+        depth: usize,
+    ) -> Result<(), UsbError> {
+        debug_assert!(
+            addr.index() != 0,
+            "set_packet_queue_depth must not be called on EP0"
+        );
+        if addr.index() == 0 || addr.direction() == UsbDirection::In {
+            return Err(UsbError::InvalidEndpoint);
+        }
+
+        let mps = self
+            .ep_allocator
+            .endpoint_mut(addr)
+            .ok_or(UsbError::InvalidEndpoint)?
+            .max_packet_len();
+
+        // Fill slots 1..depth with staging buffers. Each iteration re-borrows
+        // the endpoint because buffer_allocator and ep_allocator are both on
+        // self and Rust can't split borrow across the match.
+        for slot in 1..depth {
+            // Check if slot already filled before calling allocator.
+            let needs_buf = self
+                .ep_allocator
+                .endpoint_mut(addr)
+                .map(|ep| ep.buffers[slot].is_none())
+                .unwrap_or(false);
+            if needs_buf {
+                match self.buffer_allocator.allocate(mps) {
+                    Some(buf) => {
+                        // Safety: ep was checked above; addr is non-control OUT, already validated.
+                        if let Some(ep) = self.ep_allocator.endpoint_mut(addr) {
+                            ep.buffers[slot] = Some(buf);
+                        }
+                    }
+                    None => {
+                        return Err(UsbError::EndpointMemoryOverflow);
+                    }
+                }
+            }
+        }
+
+        // Set the configured depth.
+        if let Some(ep) = self.ep_allocator.endpoint_mut(addr) {
+            ep.set_packet_depth(depth);
+        }
+
+        // Submit `depth` 1-packet OUT staging transfers immediately.
+        for slot in 0..depth {
+            if let Some(ep) = self.ep_allocator.endpoint_mut(addr) {
+                let mps = ep.max_packet_len();
+                let ptr = ep.staging_buf_ptr(slot);
+                if ep.tds_free() > 0 {
+                    let _ = ep.submit_inner(&self.usb, ptr, mps, Some(slot as u8));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Checks if an endpoint is stalled
@@ -383,16 +680,39 @@ impl Driver {
     /// This should only be called when the device is configured
     fn enable_endpoints(&mut self) {
         for ep in self.ep_allocator.nonzero_endpoints_iter_mut() {
+            // Under the transfer feature, flush stale queue state before enabling.
+            #[cfg(feature = "transfer")]
+            ep.clear_transfers(&self.usb);
             ep.enable(&self.usb);
         }
     }
 
     /// Prime all non-zero, enabled OUT endpoints
+    ///
+    /// Under the transfer feature, eager (depth>1) OUT endpoints prime via the
+    /// queue path; depth-1 endpoints stay lazy and are primed on first `ep_read`.
     fn prime_endpoints(&mut self) {
         for ep in self.ep_allocator.nonzero_endpoints_iter_mut() {
             if ep.is_enabled(&self.usb) && ep.address().direction() == UsbDirection::Out {
-                let max_packet_len = ep.max_packet_len();
-                ep.schedule_transfer(&self.usb, max_packet_len);
+                #[cfg(feature = "transfer")]
+                {
+                    // Only prime eager endpoints here; lazy ones prime on demand.
+                    if ep.packet_depth() > 1 {
+                        let depth = ep.packet_depth();
+                        let mps = ep.max_packet_len();
+                        for slot in 0..depth {
+                            if ep.buffers[slot].is_some() && ep.tds_free() > 0 {
+                                let ptr = ep.staging_buf_ptr(slot);
+                                let _ = ep.submit_inner(&self.usb, ptr, mps, Some(slot as u8));
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "transfer"))]
+                {
+                    let max_packet_len = ep.max_packet_len();
+                    ep.schedule_transfer(&self.usb, max_packet_len);
+                }
             }
         }
     }

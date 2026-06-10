@@ -279,6 +279,100 @@ impl BusAdapter {
     }
 }
 
+/// Transfer-queue extension API for [`BusAdapter`].
+///
+/// # Transfer-queue overview
+///
+/// This API provides a zero-copy, multi-transfer-in-flight path for bulk and
+/// interrupt endpoints alongside the existing `UsbBus` single-packet path.
+///
+/// ## Retire law (EHCI)
+///
+/// A dTD is owned by the USB controller from the moment it is primed until the
+/// ACTIVE bit clears. **No field of the dTD — and no byte of the associated DMA
+/// buffer — may be read or written by software while ACTIVE is set.** Violating
+/// this rule produces silent data corruption. `poll_transfer` / `poll_transfer`
+/// enforce the retire law: they inspect ACTIVE before returning bytes.
+///
+/// ## Short-packet contract (OUT endpoints)
+///
+/// A short packet (fewer bytes than the TD announced) retires the current dTD
+/// immediately and leaves any subsequent linked dTDs in the hardware queue. For
+/// `submit_read`, callers should size OUT transfers to the announced data length
+/// (e.g. a bulk CBW is exactly 31 bytes). Misbehaving hosts are recovered via
+/// `bus_reset` / `UsbBus::reset`.
+///
+/// ## Lazy vs. eager OUT priming
+///
+/// Depth-1 OUT endpoints (the default) never have a staging transfer primed
+/// unless the class explicitly calls `UsbBus::read`. This is the *lazy* rule:
+/// it prevents the controller from swallowing a packet into a staging buffer
+/// while a zero-copy data-phase transfer is active.
+///
+/// Endpoints configured with `set_packet_queue_depth(ep, N > 1)` are *eager*:
+/// up to N staging transfers are kept primed at all times (CDC receive path).
+///
+/// ## Memory safety note
+///
+/// `submit_write` and `submit_read` accept raw slices and pass them to the DMA
+/// engine. The controller writes/reads the memory asynchronously after the call
+/// returns. Callers must guarantee that the slice remains valid and unmodified
+/// until `poll_transfer` retires the record. Whether these methods should be
+/// `unsafe fn` is an open question for upstream review; they are currently `safe`
+/// because `BusAdapter` is `no_std`-firmware-only and the aliasing contract is
+/// documented here.
+#[cfg(feature = "transfer")]
+impl BusAdapter {
+    /// Queue an IN transfer (device→host) from `buf`. Zero-copy; `buf` must
+    /// remain valid and unmodified until `poll_transfer` retires it.
+    pub fn submit_write(
+        &self,
+        ep: usb_device::endpoint::EndpointAddress,
+        buf: &[u8],
+    ) -> usb_device::Result<()> {
+        self.with_usb_mut(|usb| usb.ep_submit(ep, buf.as_ptr() as *mut u8, buf.len()))
+    }
+
+    /// Queue an OUT transfer (host→device) into `buf`. Zero-copy; `buf` must
+    /// remain valid and unmodified until `poll_transfer` retires it.
+    pub fn submit_read(
+        &self,
+        ep: usb_device::endpoint::EndpointAddress,
+        buf: &mut [u8],
+    ) -> usb_device::Result<()> {
+        self.with_usb_mut(|usb| usb.ep_submit(ep, buf.as_mut_ptr(), buf.len()))
+    }
+
+    /// Retire the oldest completed transfer on `ep`, if any.
+    ///
+    /// Returns `Some(Ok(n))` when the oldest transfer completed with `n` bytes
+    /// transferred, `Some(Err(_))` on a dTD error, or `None` if no transfer has
+    /// completed yet.
+    pub fn poll_transfer(
+        &self,
+        ep: usb_device::endpoint::EndpointAddress,
+    ) -> Option<usb_device::Result<usize>> {
+        self.with_usb_mut(|usb| usb.ep_poll_transfer(ep))
+    }
+
+    /// Number of queued (not yet retired) transfers on `ep`.
+    pub fn pending_transfers(&self, ep: usb_device::endpoint::EndpointAddress) -> usize {
+        self.with_usb(|usb| usb.ep_pending_transfers(ep))
+    }
+
+    /// Configure eager packet read-ahead depth for an OUT endpoint.
+    ///
+    /// Call after `UsbDevice` configuration and before traffic. `depth` must be
+    /// ≥ 1. Returns `Err(InvalidEndpoint)` for IN or control endpoints.
+    pub fn set_packet_queue_depth(
+        &self,
+        ep: usb_device::endpoint::EndpointAddress,
+        depth: usize,
+    ) -> usb_device::Result<()> {
+        self.with_usb_mut(|usb| usb.set_packet_queue_depth(ep, depth))
+    }
+}
+
 impl UsbBus for BusAdapter {
     /// The USB hardware can guarantee that we set the status before we receive
     /// the status, and we're taking advantage of that. We expect this flag to
