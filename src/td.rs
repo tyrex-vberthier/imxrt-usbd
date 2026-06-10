@@ -146,6 +146,27 @@ mod TOKEN {
 }
 
 #[cfg(test)]
+impl Td {
+    /// Simulate hardware transfer completion.
+    ///
+    /// Clears `ACTIVE` and sets `TOTAL_BYTES` to `remaining` (residual bytes
+    /// not transferred, as the hardware would write). For example, a 512-byte
+    /// transfer completed in full has `remaining = 0`; one that delivered only
+    /// 31 bytes out of 512 has `remaining = 512 - 31 = 481`.
+    ///
+    /// This is purely a test helper — on real hardware the controller writes
+    /// the TOKEN word directly; we replicate that here via RAL primitives.
+    // Used only in `#[cfg(feature = "transfer")]` tests; dead without the feature.
+    #[allow(dead_code)]
+    pub fn force_complete(&mut self, remaining: usize) {
+        // Clear ACTIVE bit.
+        ral::modify_reg!(crate::td, self, TOKEN, STATUS: 0);
+        // Write TOTAL_BYTES residual — keep other TOKEN fields (IOC, etc.) intact.
+        ral::modify_reg!(crate::td, self, TOKEN, TOTAL_BYTES: remaining as u32);
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::Td;
     use crate::ral;
