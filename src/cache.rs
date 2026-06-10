@@ -28,29 +28,45 @@
 /// Cleaning and invalidating causes data in the D-cache to be written back to main memory,
 /// and then marks that data in the D-cache as invalid, causing future reads to first fetch
 /// from main memory.
+///
+/// # Architecture gate
+///
+/// On non-ARM targets (e.g. x86_64 in host unit tests) this function is a documented
+/// no-op: there is no Cortex-M CBP register and no `dsb`/`isb` assembly available, and
+/// cache maintenance is meaningless when running on the host. `cfg(target_arch = "arm")`
+/// is the correct axis here (not `cfg(test)`) because it also covers `--doc` builds and
+/// dependent-crate test builds that compile for the host.
 pub fn clean_invalidate_dcache_by_address(addr: usize, size: usize) {
-    // No-op zero sized operations
-    if size == 0 {
-        return;
+    #[cfg(target_arch = "arm")]
+    {
+        // No-op zero sized operations
+        if size == 0 {
+            return;
+        }
+
+        // Safety: write-only registers, pointer to static memory
+        let cbp = unsafe { &*cortex_m::peripheral::CBP::PTR };
+
+        cortex_m::asm::dsb();
+
+        // Cache lines are fixed to 32 bit on Cortex-M7 and not present in earlier Cortex-M
+        const LINESIZE: usize = 32;
+        let num_lines = ((size - 1) / LINESIZE) + 1;
+
+        let mut addr = addr & 0xFFFF_FFE0;
+
+        for _ in 0..num_lines {
+            // Safety: write to Cortex-M write-only register
+            unsafe { cbp.dccimvac.write(addr as u32) };
+            addr += LINESIZE;
+        }
+
+        cortex_m::asm::dsb();
+        cortex_m::asm::isb();
     }
-
-    // Safety: write-only registers, pointer to static memory
-    let cbp = unsafe { &*cortex_m::peripheral::CBP::PTR };
-
-    cortex_m::asm::dsb();
-
-    // Cache lines are fixed to 32 bit on Cortex-M7 and not present in earlier Cortex-M
-    const LINESIZE: usize = 32;
-    let num_lines = ((size - 1) / LINESIZE) + 1;
-
-    let mut addr = addr & 0xFFFF_FFE0;
-
-    for _ in 0..num_lines {
-        // Safety: write to Cortex-M write-only register
-        unsafe { cbp.dccimvac.write(addr as u32) };
-        addr += LINESIZE;
+    #[cfg(not(target_arch = "arm"))]
+    {
+        // No-op on non-ARM targets: cache maintenance is meaningless outside ARM hardware.
+        let _ = (addr, size);
     }
-
-    cortex_m::asm::dsb();
-    cortex_m::asm::isb();
 }

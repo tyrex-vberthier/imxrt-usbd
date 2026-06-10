@@ -12,16 +12,26 @@ use usb_device::{
     endpoint::{EndpointAddress, EndpointType},
 };
 
-/// A list of transfer descriptors
+/// dTDs statically reserved per endpoint (per direction).
 ///
-/// Supports 1 TD per QH (per endpoint direction)
+/// With the `transfer` feature, each endpoint owns a pool of 8 dTDs so a
+/// transfer queue can hold up to 8 chained descriptors (e.g. two 64 KiB
+/// transfers of 4×16 KiB, or eight 1-packet transfers). Without the
+/// feature the layout matches the historical 1 TD per QH.
+pub(crate) const TDS_PER_EP: usize = if cfg!(feature = "transfer") { 8 } else { 1 };
+
+/// A list of transfer descriptor pools.
+///
+/// Each endpoint slot holds `TDS_PER_EP` TDs laid out contiguously so that
+/// every TD is individually 32-byte-aligned (Td is 32 B on ARM).
 #[repr(align(32))]
-struct TdList<const COUNT: usize>([UnsafeCell<Td>; COUNT]);
+struct TdList<const COUNT: usize>([UnsafeCell<[Td; TDS_PER_EP]>; COUNT]);
 
 impl<const COUNT: usize> TdList<COUNT> {
     const fn new() -> Self {
-        const TD: UnsafeCell<Td> = UnsafeCell::new(Td::new());
-        Self([TD; COUNT])
+        const TD_POOL: UnsafeCell<[Td; TDS_PER_EP]> =
+            UnsafeCell::new([const { Td::new() }; TDS_PER_EP]);
+        Self([TD_POOL; COUNT])
     }
 }
 
@@ -150,7 +160,7 @@ impl<const COUNT: usize> EndpointState<COUNT> {
 
 pub struct EndpointAllocator<'a> {
     qh_list: &'a [UnsafeCell<Qh>],
-    td_list: &'a [UnsafeCell<Td>],
+    td_list: &'a [UnsafeCell<[Td; TDS_PER_EP]>],
     ep_list: &'a [UnsafeCell<MaybeUninit<Endpoint>>],
     alloc_mask: &'a AtomicU32,
 }
@@ -267,7 +277,7 @@ impl EndpointAllocator<'_> {
         // allocation, and ensures that we only release one &mut reference for each
         // component.
         let qh = unsafe { &mut *self.qh_list[index].get() };
-        let td = unsafe { &mut *self.td_list[index].get() };
+        let tds: &'static mut [Td] = unsafe { &mut (&mut *self.td_list[index].get())[..] };
         // We cannot access these two components after this call. The endpoint
         // takes mutable references, so it has exclusive ownership of both.
         // This module is designed to isolate this access so we can visually
@@ -276,7 +286,7 @@ impl EndpointAllocator<'_> {
         // EP is uninitialized.
         let ep = unsafe { &mut *self.ep_list[index].get() };
         // Nothing to drop here.
-        ep.write(Endpoint::new(addr, qh, td, buffer, kind));
+        ep.write(Endpoint::new(addr, qh, tds, buffer, kind));
         // Safety: EP is initialized.
         Some(unsafe { ep.assume_init_mut() })
     }

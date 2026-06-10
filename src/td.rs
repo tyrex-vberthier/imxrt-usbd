@@ -162,7 +162,7 @@ mod test {
         let mut td = Td::new();
         td.set_terminate();
 
-        let other = u32::max_value() & !(31);
+        let other = !31u32;
         td.set_next(other as *const _);
         assert_eq!(td.NEXT.read(), other);
     }
@@ -170,21 +170,21 @@ mod test {
     #[test]
     fn status() {
         let mut td = Td::new();
-        ral::write_reg!(super, &mut td, TOKEN, STATUS: u32::max_value());
+        ral::write_reg!(super, &mut td, TOKEN, STATUS: u32::MAX);
         assert_eq!(td.TOKEN.read(), 0b11111111);
     }
 
     #[test]
     fn ioc() {
         let mut td = Td::new();
-        ral::write_reg!(super, &mut td, TOKEN, IOC: u32::max_value());
+        ral::write_reg!(super, &mut td, TOKEN, IOC: u32::MAX);
         assert_eq!(td.TOKEN.read(), 1 << 15);
     }
 
     #[test]
     fn total_bytes() {
         let mut td = Td::new();
-        ral::write_reg!(super, &mut td, TOKEN, TOTAL_BYTES: u32::max_value());
+        ral::write_reg!(super, &mut td, TOKEN, TOTAL_BYTES: u32::MAX);
         assert_eq!(td.TOKEN.read(), 0x7FFF << 16);
     }
 
