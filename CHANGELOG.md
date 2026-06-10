@@ -10,6 +10,8 @@ for bulk/interrupt endpoints.
 - `BusAdapter::submit_write` / `submit_read` queue zero-copy IN/OUT transfers.
 - `BusAdapter::poll_transfer` retires the oldest completed transfer.
 - `BusAdapter::pending_transfers` counts in-flight transfers on an endpoint.
+- `BusAdapter::cancel_transfers` drops all queued and in-flight transfers on an
+  endpoint, for class-level reconfiguration.
 - `BusAdapter::set_packet_queue_depth` configures eager OUT packet read-ahead.
 - The packet path (`UsbBus::read` / `write`) is re-expressed over staging
   buffers under the feature; without the feature the build is behaviorally

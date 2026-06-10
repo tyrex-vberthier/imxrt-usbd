@@ -564,6 +564,27 @@ impl Driver {
             .unwrap_or(0)
     }
 
+    /// Cancel every queued transfer on `addr`: flush the hardware prime and
+    /// drop all software queue records (staging and zero-copy alike).
+    ///
+    /// For class-level reconfiguration of a *shared* endpoint — e.g. a
+    /// SET_INTERFACE alternate-setting switch where the previous alt left a
+    /// primed transfer that would otherwise swallow the new alt's data
+    /// (HW-observed 2026-06-11: a stale 512-byte BOT CBW staging prime on the
+    /// shared bulk-OUT consumed the first packet of the first UAS WRITE data
+    /// phase). Bus reset and `enable_endpoints` already clear queues; this is
+    /// the explicit per-endpoint hook for alt switches, which the bus layer
+    /// never sees. No-op on EP0 and unallocated endpoints.
+    #[cfg(feature = "transfer")]
+    pub fn ep_cancel_transfers(&mut self, addr: EndpointAddress) {
+        if addr.index() == 0 {
+            return;
+        }
+        if let Some(ep) = self.ep_allocator.endpoint_mut(addr) {
+            ep.clear_transfers(&self.usb);
+        }
+    }
+
     /// Allocate `depth - 1` extra max-packet staging buffers for `addr` and keep
     /// `depth` 1-packet OUT transfers primed through the packet path (eager
     /// read-ahead). Call after `UsbDevice` configuration, before traffic.

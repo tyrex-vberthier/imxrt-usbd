@@ -360,6 +360,19 @@ impl BusAdapter {
         self.with_usb(|usb| usb.ep_pending_transfers(ep))
     }
 
+    /// Cancel every queued transfer on `ep`: flush the hardware prime and drop
+    /// all software queue records (staging and zero-copy alike).
+    ///
+    /// For class-level reconfiguration of a shared endpoint — e.g. a
+    /// SET_INTERFACE alternate-setting switch where a transfer primed by the
+    /// previous alt setting would otherwise swallow the new alt's data. The
+    /// bus layer never observes alt switches, so the class/firmware must call
+    /// this explicitly when it changes which protocol owns an endpoint.
+    /// No-op on EP0 and unallocated endpoints.
+    pub fn cancel_transfers(&self, ep: usb_device::endpoint::EndpointAddress) {
+        self.with_usb_mut(|usb| usb.ep_cancel_transfers(ep));
+    }
+
     /// Configure eager packet read-ahead depth for an OUT endpoint.
     ///
     /// Call after `UsbDevice` configuration and before traffic. `depth` must be
