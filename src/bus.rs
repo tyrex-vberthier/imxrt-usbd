@@ -21,6 +21,24 @@ use usb_device::{
 
 pub use super::driver::Speed;
 
+/// Busy-wait cycles the D+ pull-up is held low during [`force_reset`], between
+/// dropping the bus (`detach`) and re-asserting it (`attach`).
+///
+/// This is a *hardware*-timing requirement, not a software-synchronisation
+/// delay: the host detects a disconnect purely electrically (D+ held at SE0),
+/// and there is no device-observable signal for "the host noticed". A bounded
+/// busy-wait is therefore the correct primitive — there is nothing to poll on.
+///
+/// The value is sized generously for the i.MX RT10xx M7 cores: at 600 MHz
+/// (RT1064) this is ~10 ms, and longer at lower core clocks (~12 ms at the
+/// 500 MHz RT1011). USB hosts register a disconnect within microseconds, so a
+/// few-millisecond hold has a wide margin. The library cannot know the core
+/// clock, so this is a conservative floor; tune it on the bench if a specific
+/// host needs a longer (or wants a shorter) disconnect window.
+///
+/// [`force_reset`]: UsbBus::force_reset
+const DETACH_HOLD_CYCLES: u32 = 6_000_000;
+
 /// A full- and high-speed `UsbBus` implementation
 ///
 /// The `BusAdapter` adapts the USB peripheral instances, and exposes a `UsbBus` implementation.
@@ -444,6 +462,26 @@ impl UsbBus for BusAdapter {
         self.with_usb_mut(|usb| {
             usb.bus_reset();
         });
+    }
+
+    /// Simulate a disconnect so the host re-enumerates the device.
+    ///
+    /// Clears the controller's Run/Stop bit (removing the D+ pull-up), holds
+    /// the disconnect for `DETACH_HOLD_CYCLES` so the host registers it, then
+    /// re-asserts Run/Stop. The host then drives a bus reset, which flows
+    /// through [`reset`](UsbBus::reset) and tears down any in-flight transfers;
+    /// the device must be re-configured (call [`configure`](BusAdapter::configure)
+    /// again) once it reaches the configured state, exactly as after any reset.
+    ///
+    /// The whole detach/hold/attach sequence runs inside the bus critical
+    /// section, so it is not interrupted by USB ISR activity.
+    fn force_reset(&self) -> usb_device::Result<()> {
+        self.with_usb_mut(|usb| {
+            usb.detach();
+            cortex_m::asm::delay(DETACH_HOLD_CYCLES);
+            usb.attach();
+        });
+        Ok(())
     }
 
     fn write(&self, ep_addr: EndpointAddress, buf: &[u8]) -> usb_device::Result<usize> {

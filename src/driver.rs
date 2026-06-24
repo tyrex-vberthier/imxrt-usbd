@@ -165,6 +165,18 @@ impl Driver {
         ral::modify_reg!(ral::usb, self.usb, USBCMD, RS: 1);
     }
 
+    /// Clear the Run/Stop bit, halting the controller and removing the D+
+    /// pull-up. The host sees the device disconnect.
+    ///
+    /// This is the symmetric counterpart to [`attach()`](Driver::attach): pair
+    /// `detach()` with a brief hold and a follow-up `attach()` to force the host
+    /// to re-enumerate the device (see [`BusAdapter::force_reset`]).
+    ///
+    /// [`BusAdapter::force_reset`]: crate::BusAdapter
+    pub fn detach(&mut self) {
+        ral::modify_reg!(ral::usb, self.usb, USBCMD, RS: 0);
+    }
+
     pub fn bus_reset(&mut self) {
         ral::modify_reg!(ral::usb, self.usb, ENDPTSTAT, |endptstat| endptstat);
 
